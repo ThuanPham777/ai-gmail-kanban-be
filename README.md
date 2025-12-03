@@ -31,10 +31,27 @@ JWT_ACCESS_SECRET=replace-with-strong-secret
 JWT_ACCESS_EXPIRES=15m
 JWT_REFRESH_SECRET=replace-with-refresh-secret # falls back to access secret if omitted
 JWT_REFRESH_EXPIRES=7d
+
+# Google Identity Services (app login only)
 GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
+
+# IMAP account that powers the inbox (Track B)
+IMAP_HOST=imap.gmail.com
+IMAP_PORT=993
+IMAP_SECURE=true
+IMAP_USER=your-test-mailbox@gmail.com
+IMAP_PASS=app-password-or-secret
+
+# SMTP settings used to send/reply
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_USER=your-test-mailbox@gmail.com
+SMTP_PASS=app-password-or-secret
 ```
 
-> **Heads-up:** `GOOGLE_CLIENT_ID` must match the client ID the frontend passes to Google Identity Services. Register the same value under *Authorized JavaScript origins* that host the frontend.
+> **Heads-up:** `GOOGLE_CLIENT_ID` must match the client ID configured in Google Identity Services (used for app login).
+> The IMAP/SMTP credentials should point to a test mailbox that the backend can log into (e.g., a Gmail account with IMAP enabled and an App Password).
 
 ### Useful Commands
 | Action | Command |
