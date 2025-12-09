@@ -9,11 +9,14 @@ export type UserDocument = User & Document;
   collection: 'users',
 })
 export class User {
+  toJSON() {
+      throw new Error('Method not implemented.');
+  }
   @Prop({ required: true, unique: true, lowercase: true, trim: true })
   email: string;
 
   @Prop({
-    required: function () {
+    required: function (this: User) {
       return this.provider === 'password';
     },
   })
@@ -32,11 +35,29 @@ export class User {
   })
   provider: 'password' | 'google';
 
+  // Google identity (để identify user)
   @Prop({ required: false, unique: true, sparse: true })
   googleId?: string;
 
+  // Refresh token của app (JWT refresh)
   @Prop({ required: false })
   refreshToken?: string;
+
+  // Gmail OAuth (per-user)
+  @Prop({
+    required: false,
+    type: {
+      refreshToken: { type: String, required: false },
+      scope: { type: String, required: false },
+      connectedAt: { type: Date, required: false },
+    },
+    _id: false,
+  })
+  gmail?: {
+    refreshToken?: string;
+    scope?: string;
+    connectedAt?: Date;
+  };
 
   @Prop({ default: Date.now })
   createdAt: Date;
@@ -48,6 +69,10 @@ export const UserSchema = SchemaFactory.createForClass(User);
 UserSchema.set('toJSON', {
   transform: (_doc: any, ret: any) => {
     delete ret.password;
+    if (ret.gmail?.refreshToken) {
+      // không nên trả token ra client
+      delete ret.gmail.refreshToken;
+    }
     return ret;
   },
 });
