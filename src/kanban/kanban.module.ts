@@ -1,0 +1,19 @@
+import { Module } from '@nestjs/common';
+import { MongooseModule } from '@nestjs/mongoose';
+import { KanbanController } from './kanban.controller';
+import { KanbanService } from './kanban.service';
+import { UsersModule } from '../users/users.module';
+import { EmailItem, EmailItemSchema } from './schemas/email-item.chema';
+import { KanbanCron } from './kanban.cron';
+import { AiModule } from 'src/ai/ai.module';
+
+@Module({
+    imports: [
+        MongooseModule.forFeature([{ name: EmailItem.name, schema: EmailItemSchema }]),
+        UsersModule,
+        AiModule,
+    ],
+    controllers: [KanbanController],
+    providers: [KanbanService, KanbanCron],
+})
+export class KanbanModule { }

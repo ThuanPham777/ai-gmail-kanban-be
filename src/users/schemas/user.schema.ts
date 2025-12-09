@@ -9,9 +9,6 @@ export type UserDocument = User & Document;
   collection: 'users',
 })
 export class User {
-  toJSON() {
-      throw new Error('Method not implemented.');
-  }
   @Prop({ required: true, unique: true, lowercase: true, trim: true })
   email: string;
 
