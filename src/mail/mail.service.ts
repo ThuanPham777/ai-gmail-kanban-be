@@ -1,18 +1,16 @@
 import {
     Injectable,
-    InternalServerErrorException,
-    NotFoundException,
     BadRequestException,
-    HttpException,
+    NotFoundException,
+    UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ImapFlow } from 'imapflow';
-import { simpleParser } from 'mailparser';
-import * as nodemailer from 'nodemailer';
+import { google } from 'googleapis';
+import { UsersService } from '../users/users.service';
 
 interface EmailListItem {
-    id: string;
-    mailboxId: string;
+    id: string;          // format: labelId|messageId
+    mailboxId: string;   // labelId
     senderName: string;
     senderEmail: string;
     subject: string;
@@ -28,11 +26,12 @@ interface EmailDetail extends EmailListItem {
     cc?: string[];
     body: string;
     attachments?: {
-        id: string;
+        id: string;        // gmail attachmentId
         fileName: string;
         size: string;
         type: string;
     }[];
+    threadId?: string;
 }
 
 interface ModifyActions {
@@ -45,378 +44,401 @@ interface ModifyActions {
 
 @Injectable()
 export class MailService {
-    private readonly imapOptions: any;
-    private readonly smtpTransport: nodemailer.Transporter;
+    constructor(
+        private readonly config: ConfigService,
+        private readonly usersService: UsersService,
+    ) { }
 
-    constructor(private readonly config: ConfigService) {
-        this.imapOptions = {
-            host: this.config.getOrThrow<string>('IMAP_HOST'),
-            port: Number(this.config.get<string>('IMAP_PORT') ?? 993),
-            secure: this.config.get<string>('IMAP_SECURE') !== 'false',
-            auth: {
-                user: this.config.getOrThrow<string>('IMAP_USER'),
-                pass: this.config.getOrThrow<string>('IMAP_PASS'),
-            },
-        };
-
-        this.smtpTransport = nodemailer.createTransport({
-            host: this.config.getOrThrow<string>('SMTP_HOST'),
-            port: Number(this.config.get<string>('SMTP_PORT') ?? 465),
-            secure: this.config.get<string>('SMTP_SECURE') !== 'false',
-            auth: {
-                user: this.config.getOrThrow<string>('SMTP_USER'),
-                pass: this.config.getOrThrow<string>('SMTP_PASS'),
-            },
-        });
-    }
-
-
-
-    private composeEmailId(mailboxId: string, uid: number) {
-        return `${encodeURIComponent(mailboxId)}|${uid}`;
+    private composeEmailId(mailboxId: string, messageId: string) {
+        return `${encodeURIComponent(mailboxId)}|${messageId}`;
     }
 
     private parseEmailId(emailId: string) {
-        const [encodedMailbox, uidStr] = emailId.split('|');
+        const [encodedMailbox, messageId] = emailId.split('|');
         const mailboxId = decodeURIComponent(encodedMailbox ?? '');
-        const uid = Number(uidStr);
-        if (!mailboxId || !Number.isFinite(uid)) {
+        if (!mailboxId || !messageId) {
             throw new BadRequestException('Invalid email id');
         }
-        return { mailboxId, uid };
+        return { mailboxId, messageId };
     }
 
-    private async withClient<T>(handler: (client: ImapFlow) => Promise<T>): Promise<T> {
-        const client = new ImapFlow(this.imapOptions);
-        try {
-            await client.connect();
-            return await handler(client);
-        } catch (error) {
-            // Nếu là HttpException (NotFound, BadRequest, ...) thì giữ nguyên
-            if (error instanceof HttpException) {
-                throw error;
-            }
-            throw new InternalServerErrorException(error?.message || 'IMAP operation failed');
-        } finally {
-            try {
-                await client.logout();
-            } catch {
-                // ignore
+    private async getGmailClient(userId: string) {
+        const { refreshToken } = await this.usersService.getGmailRefreshToken(userId);
+
+        const clientId = this.config.getOrThrow<string>('GOOGLE_CLIENT_ID');
+        const clientSecret = this.config.getOrThrow<string>('GOOGLE_CLIENT_SECRET');
+        const redirectUri = this.config.getOrThrow<string>('GOOGLE_REDIRECT_URI');
+
+        const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+        oAuth2Client.setCredentials({ refresh_token: refreshToken });
+
+        return google.gmail({ version: 'v1', auth: oAuth2Client });
+    }
+
+    private getHeader(headers: any[] | undefined, name: string) {
+        const h = headers?.find((x) => (x.name || '').toLowerCase() === name.toLowerCase());
+        return h?.value ?? '';
+    }
+
+    private parseAddress(raw: string) {
+        // format đơn giản: "Name <email>" hoặc "email"
+        const match = raw.match(/(.*)<(.+@.+)>/);
+        if (match) {
+            return { name: match[1].trim().replace(/^"|"$/g, ''), email: match[2].trim() };
+        }
+        return { name: raw || 'Unknown', email: raw };
+    }
+
+    private base64UrlDecode(input: string) {
+        const pad = '='.repeat((4 - (input.length % 4)) % 4);
+        const base64 = (input + pad).replace(/-/g, '+').replace(/_/g, '/');
+        return Buffer.from(base64, 'base64').toString('utf8');
+    }
+
+    private extractBody(payload: any): string {
+        if (!payload) return '<p>No content</p>';
+
+        // ưu tiên text/html
+        if (payload.mimeType === 'text/html' && payload.body?.data) {
+            return this.base64UrlDecode(payload.body.data);
+        }
+        if (payload.mimeType === 'text/plain' && payload.body?.data) {
+            const text = this.base64UrlDecode(payload.body.data);
+            return `<pre>${text}</pre>`;
+        }
+
+        // duyệt parts
+        if (payload.parts?.length) {
+            // tìm html
+            for (const p of payload.parts) {
+                const html = this.extractBody(p);
+                if (html && !html.includes('No content')) return html;
             }
         }
+
+        return '<p>No content</p>';
     }
 
-    private formatAddress(address?: { name?: string; address?: string }) {
-        if (!address) return { name: 'Unknown sender', email: '' };
-        return {
-            name: address.name || address.address || 'Unknown sender',
-            email: address.address || '',
+    private extractAttachments(payload: any) {
+        const result: Array<{ id: string; fileName: string; size: string; type: string }> = [];
+
+        const walk = (node: any) => {
+            if (!node) return;
+
+            const filename = node.filename;
+            const body = node.body;
+
+            if (filename && body?.attachmentId) {
+                result.push({
+                    id: body.attachmentId,
+                    fileName: filename,
+                    size: `${body.size ?? 0} bytes`,
+                    type: node.mimeType ?? 'application/octet-stream',
+                });
+            }
+
+            if (node.parts?.length) {
+                for (const p of node.parts) walk(p);
+            }
         };
+
+        walk(payload);
+        return result.length ? result : undefined;
     }
 
-    async getMailboxes() {
-        return this.withClient(async (client) => {
-            const list = await client.list();
-            const items: Array<{ id: string; name: string; unread?: number }> = [];
-            for (const mailbox of list) {
-                if (mailbox.path?.startsWith('[Gmail]/Chats')) continue;
-                const status = await client.status(mailbox.path, { unseen: true }).catch(() => ({ unseen: 0 }));
-                items.push({
-                    id: mailbox.path,
-                    name: mailbox.name ?? mailbox.path,
-                    unread: status?.unseen ?? 0,
-                });
-            }
-            return items;
-        });
-    }
+    // ✅ Labels = "mailboxes"
+    async getMailboxes(userId: string) {
+        const gmail = await this.getGmailClient(userId);
+        const res = await gmail.users.labels.list({ userId: 'me' });
 
-    async getEmailsByMailbox(mailboxId: string, page = 1, pageSize = 20) {
-        const safePage = page > 0 ? page : 1;
-        const safeSize = Math.min(Math.max(pageSize, 1), 100);
-        return this.withClient(async (client) => {
-            const lock = await client.getMailboxLock(mailboxId);
-            try {
-                const mailboxInfo = client.mailbox;
-                if (!mailboxInfo) {
-                    throw new NotFoundException('Mailbox not available');
-                }
-                const total = mailboxInfo.exists ?? 0;
-                if (!total) {
-                    return {
-                        data: [],
-                        meta: { total: 0, page: safePage, pageSize: safeSize },
-                    };
-                }
+        const labels = res.data.labels ?? [];
 
-                const endSeq = Math.max(1, total - (safePage - 1) * safeSize);
-                const startSeq = Math.max(1, endSeq - safeSize + 1);
-                const range = `${startSeq}:${endSeq}`;
-
-                const messages: EmailListItem[] = [];
-                for await (const message of client.fetch(
-                    { seq: range },
-                    { envelope: true, flags: true, uid: true, internalDate: true },
-                )) {
-                    if (!message) continue;
-                    const fromAddress = this.formatAddress(message.envelope?.from?.[0]);
-                    const timestampSource = message.envelope?.date || message.internalDate || new Date();
-                    const timestamp = new Date(timestampSource).toISOString();
-                    const flags = message.flags || new Set<string>();
-                    messages.unshift({
-                        id: this.composeEmailId(mailboxId, message.uid),
-                        mailboxId,
-                        senderName: fromAddress.name,
-                        senderEmail: fromAddress.email,
-                        subject: message.envelope?.subject || '(No subject)',
-                        preview: message.envelope?.subject || '',
-                        timestamp,
-                        starred: flags.has('\\Flagged'),
-                        unread: !flags.has('\\Seen'),
-                        important: false,
-                    });
-                }
-
-                return {
-                    data: messages,
-                    meta: {
-                        total,
-                        page: safePage,
-                        pageSize: safeSize,
-                    },
-                };
-            } finally {
-                lock.release();
-            }
-        });
-    }
-
-    async getEmailById(emailId: string): Promise<EmailDetail> {
-        const { mailboxId, uid } = this.parseEmailId(emailId);
-
-        return this.withClient(async (client) => {
-            const lock = await client.getMailboxLock(mailboxId);
-            try {
-                const message = await client.fetchOne(
-                    uid,
-                    {
-                        source: true,
-                        envelope: true,
-                        flags: true,
-                        internalDate: true,
-                        bodyStructure: true,
-                    },
-                    { uid: true },
-                );
-                if (!message || !message.source) {
-                    throw new NotFoundException('Email not found');
-                }
-
-                const parsed = await simpleParser(message.source);
-                const fromAddress = this.formatAddress(message.envelope?.from?.[0]);
-
-                // ✅ Dùng bodyStructure để tìm attachment & luôn dùng partId
-                const rawAttachments = this.extractAttachments(message.bodyStructure);
-                const attachments =
-                    rawAttachments.length > 0
-                        ? rawAttachments.map((a) => ({
-                            id: a.partId, // 👈 id trả về cho FE chính là partId
-                            fileName: a.filename,
-                            size: `${a.size} bytes`,
-                            type: a.mimeType,
-                        }))
-                        : undefined;
-
-                const timestampSource = message.envelope?.date || message.internalDate || new Date();
-                const timestamp = new Date(timestampSource).toISOString();
-                const flags = message.flags || new Set<string>();
-
-                return {
-                    id: this.composeEmailId(mailboxId, uid),
-                    mailboxId,
-                    senderName: fromAddress.name,
-                    senderEmail: fromAddress.email,
-                    subject: message.envelope?.subject || '(No subject)',
-                    preview: parsed.subject || '',
-                    timestamp,
-                    starred: flags.has('\\Flagged'),
-                    unread: !flags.has('\\Seen'),
-                    important: false,
-                    to: (parsed.to?.value || []).map((addr) => addr.address || '').filter(Boolean),
-                    cc: parsed.cc?.value?.map((addr) => addr.address || '').filter(Boolean),
-                    body:
-                        parsed.html ||
-                        parsed.textAsHtml ||
-                        (parsed.text ? `<pre>${parsed.text}</pre>` : '<p>No content</p>'),
-                    attachments,
-                };
-            } finally {
-                lock.release();
-            }
-        });
-    }
-
-    async sendEmail(data: { to: string[]; subject: string; body: string; cc?: string[]; bcc?: string[] }) {
-        if (!data.to?.length) throw new BadRequestException('At least one recipient is required');
-        const info = await this.smtpTransport.sendMail({
-            from: this.smtpTransport.options.auth?.user,
-            to: data.to.join(','),
-            cc: data.cc?.length ? data.cc.join(',') : undefined,
-            bcc: data.bcc?.length ? data.bcc.join(',') : undefined,
-            subject: data.subject,
-            html: data.body,
-        });
-        return info.messageId;
-    }
-
-    async replyToEmail(emailId: string, body: string, replyAll = false) {
-        const { mailboxId, uid } = this.parseEmailId(emailId);
-        return this.withClient(async (client) => {
-            const lock = await client.getMailboxLock(mailboxId);
-            try {
-                const message = await client.fetchOne(uid, { envelope: true, source: true }, { uid: true });
-                if (!message || !message.envelope) throw new NotFoundException('Original message not found');
-                const from = message.envelope.from?.[0];
-                if (!from?.address) throw new BadRequestException('Original sender missing');
-
-                const recipients = replyAll
-                    ? Array.from(
-                        new Set(
-                            [
-                                from.address,
-                                ...(message.envelope.to?.map((addr) => addr.address) ?? []),
-                                ...(message.envelope.cc?.map((addr) => addr.address) ?? []),
-                            ]
-                                .filter(Boolean)
-                                .filter((addr) => addr !== this.smtpTransport.options.auth?.user),
-                        ),
-                    )
-                    : [from.address];
-
-                const subject = message.envelope.subject?.startsWith('Re:')
-                    ? message.envelope.subject
-                    : `Re: ${message.envelope.subject ?? ''}`;
-
-                const info = await this.smtpTransport.sendMail({
-                    from: this.smtpTransport.options.auth?.user,
-                    to: recipients.join(','),
-                    subject,
-                    html: body,
-                    inReplyTo: message.envelope.messageId,
-                    references: message.envelope.messageId,
-                });
-                return info.messageId;
-            } finally {
-                lock.release();
-            }
-        });
-    }
-
-    async modifyEmail(emailId: string, actions: ModifyActions) {
-        const { mailboxId, uid } = this.parseEmailId(emailId);
-        return this.withClient(async (client) => {
-            const lock = await client.getMailboxLock(mailboxId);
-            try {
-                if (actions.markRead) {
-                    await client.messageFlagsAdd({ uid }, ['\\Seen']);
-                }
-                if (actions.markUnread) {
-                    await client.messageFlagsRemove({ uid }, ['\\Seen']);
-                }
-                if (actions.star) {
-                    await client.messageFlagsAdd({ uid }, ['\\Flagged']);
-                }
-                if (actions.unstar) {
-                    await client.messageFlagsRemove({ uid }, ['\\Flagged']);
-                }
-                if (actions.delete) {
-                    await client.messageDelete({ uid });
-                }
-            } finally {
-                lock.release();
-            }
-        });
-    }
-
-    async getAttachment(emailId: string, attachmentId: string) {
-        const { mailboxId, uid } = this.parseEmailId(emailId);
-
-        return this.withClient(async (client) => {
-            const lock = await client.getMailboxLock(mailboxId);
-            try {
-                const meta = await client.fetchOne(uid, { bodyStructure: true }, { uid: true });
-                if (!meta) {
-                    throw new NotFoundException('Message not found');
-                }
-
-                const attachments = this.extractAttachments(meta.bodyStructure);
-                const attachment = attachments.find((a) => a.partId === attachmentId);
-
-                if (!attachment) {
-                    throw new NotFoundException('Attachment not found');
-                }
-
-                const download = await client.download(uid, attachment.partId, { uid: true });
-
-                // ✅ ĐỌC HẾT STREAM VÀO BUFFER TRƯỚC KHI LOGOUT
-                const chunks: Buffer[] = [];
-                for await (const chunk of download.content) {
-                    chunks.push(chunk as Buffer);
-                }
-                const buffer = Buffer.concat(chunks);
-
-                return {
-                    data: buffer,
-                    mimeType: attachment.mimeType,
-                    filename: attachment.filename,
-                };
-            } finally {
-                lock.release();
-            }
-        });
-    }
-
-    private extractAttachments(
-        structure: any,
-        list: Array<{ partId: string; filename: string; size: number; mimeType: string }> = [],
-    ) {
-        if (!structure) return list;
-
-        const type = (structure.type || '').toLowerCase();
-        const subtype = (structure.subtype || '').toLowerCase();
-        const disposition = (structure.disposition?.type || '').toLowerCase();
-
-        const filename =
-            structure.disposition?.params?.filename ||
-            structure.parameters?.name ||
-            '';
-
-        const hasFilename = !!filename;
-        const contentType = `${type}/${subtype}`.toLowerCase();
-
-        // phần có filename và không phải text/* coi như attachment
-        const isAttachment =
-            disposition === 'attachment' ||
-            (disposition === 'inline' && hasFilename && type !== 'text') ||
-            (hasFilename && type !== 'text');
-
-        if (isAttachment) {
-            list.push({
-                partId: structure.part || '1',
-                filename: filename || `attachment-${structure.part || Math.random().toString(36).slice(2)}`,
-                size: structure.size || 0,
-                mimeType: contentType || 'application/octet-stream',
+        // Lấy unread count (có thể tốn call nhưng ok cho demo)
+        const items: Array<{ id: string; name: string; unread?: number }> = [];
+        for (const lb of labels) {
+            if (!lb.id) continue;
+            const detail = await gmail.users.labels.get({ userId: 'me', id: lb.id }).catch(() => null);
+            items.push({
+                id: lb.id,
+                name: lb.name ?? lb.id,
+                unread: detail?.data?.messagesUnread ?? 0,
             });
         }
 
-        if (structure.childNodes?.length) {
-            for (const child of structure.childNodes) {
-                this.extractAttachments(child, list);
+        return items;
+    }
+
+    // ✅ Page number không phải native của Gmail API
+    // Mình implement tối thiểu để giữ contract FE:
+    async getEmailsByMailbox(userId: string, mailboxId: string, page = 1, pageSize = 20) {
+        const gmail = await this.getGmailClient(userId);
+        const safePage = page > 0 ? page : 1;
+        const safeSize = Math.min(Math.max(pageSize, 1), 50);
+
+        // duyệt pageToken tuần tự tới page cần lấy
+        let pageToken: string | undefined = undefined;
+        for (let i = 1; i < safePage; i++) {
+            const step = await gmail.users.messages.list({
+                userId: 'me',
+                labelIds: [mailboxId],
+                maxResults: safeSize,
+                pageToken,
+            });
+            pageToken = step.data.nextPageToken ?? undefined;
+            if (!pageToken) break;
+        }
+
+        const list = await gmail.users.messages.list({
+            userId: 'me',
+            labelIds: [mailboxId],
+            maxResults: safeSize,
+            pageToken,
+        });
+
+        const msgs = list.data.messages ?? [];
+
+        const data: EmailListItem[] = [];
+        for (const m of msgs) {
+            if (!m.id) continue;
+
+            const detail = await gmail.users.messages.get({
+                userId: 'me',
+                id: m.id,
+                format: 'metadata',
+                metadataHeaders: ['From', 'Subject', 'Date'],
+            });
+
+            const headers = detail.data.payload?.headers ?? [];
+            const fromRaw = this.getHeader(headers, 'From');
+            const subject = this.getHeader(headers, 'Subject') || '(No subject)';
+            const dateRaw = this.getHeader(headers, 'Date');
+
+            const from = this.parseAddress(fromRaw);
+            const labelIds = detail.data.labelIds ?? [];
+
+            data.push({
+                id: this.composeEmailId(mailboxId, m.id),
+                mailboxId,
+                senderName: from.name,
+                senderEmail: from.email,
+                subject,
+                preview: subject,
+                timestamp: dateRaw ? new Date(dateRaw).toISOString() : new Date().toISOString(),
+                starred: labelIds.includes('STARRED'),
+                unread: labelIds.includes('UNREAD'),
+                important: labelIds.includes('IMPORTANT'),
+            });
+        }
+
+        return {
+            data,
+            meta: {
+                total: undefined, // Gmail API không trả total theo label dễ dàng
+                page: safePage,
+                pageSize: safeSize,
+                nextPageToken: list.data.nextPageToken ?? null,
+            },
+        };
+    }
+
+    async getEmailById(userId: string, emailId: string): Promise<EmailDetail> {
+        const { mailboxId, messageId } = this.parseEmailId(emailId);
+        const gmail = await this.getGmailClient(userId);
+
+        const msg = await gmail.users.messages.get({
+            userId: 'me',
+            id: messageId,
+            format: 'full',
+        });
+
+        if (!msg.data) throw new NotFoundException('Email not found');
+
+        const headers = msg.data.payload?.headers ?? [];
+        const fromRaw = this.getHeader(headers, 'From');
+        const subject = this.getHeader(headers, 'Subject') || '(No subject)';
+        const dateRaw = this.getHeader(headers, 'Date');
+        const toRaw = this.getHeader(headers, 'To');
+        const ccRaw = this.getHeader(headers, 'Cc');
+
+        const from = this.parseAddress(fromRaw);
+        const labelIds = msg.data.labelIds ?? [];
+
+        const body = this.extractBody(msg.data.payload);
+        const attachments = this.extractAttachments(msg.data.payload);
+
+        const to = toRaw
+            ? toRaw.split(',').map((s) => this.parseAddress(s.trim()).email).filter(Boolean)
+            : [];
+
+        const cc = ccRaw
+            ? ccRaw.split(',').map((s) => this.parseAddress(s.trim()).email).filter(Boolean)
+            : undefined;
+
+        return {
+            id: this.composeEmailId(mailboxId, messageId),
+            mailboxId,
+            senderName: from.name,
+            senderEmail: from.email,
+            subject,
+            preview: subject,
+            timestamp: dateRaw ? new Date(dateRaw).toISOString() : new Date().toISOString(),
+            starred: labelIds.includes('STARRED'),
+            unread: labelIds.includes('UNREAD'),
+            important: labelIds.includes('IMPORTANT'),
+            to,
+            cc,
+            body,
+            attachments,
+            threadId: msg.data.threadId ?? undefined,
+        };
+    }
+
+    private buildRawEmail(from: string, to: string[], subject: string, html: string, extraHeaders?: Record<string, string>) {
+        const headers: string[] = [
+            `From: ${from}`,
+            `To: ${to.join(', ')}`,
+            `Subject: ${subject}`,
+            'MIME-Version: 1.0',
+            'Content-Type: text/html; charset="UTF-8"',
+        ];
+
+        if (extraHeaders) {
+            for (const [k, v] of Object.entries(extraHeaders)) {
+                headers.splice(3, 0, `${k}: ${v}`); // chèn trước MIME lines
             }
         }
 
-        return list;
+        const message = `${headers.join('\r\n')}\r\n\r\n${html}`;
+        return Buffer.from(message)
+            .toString('base64')
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/g, '');
     }
 
-}
+    async sendEmail(userId: string, data: { to: string[]; subject: string; body: string; cc?: string[]; bcc?: string[] }) {
+        if (!data.to?.length) throw new BadRequestException('At least one recipient is required');
 
+        const gmail = await this.getGmailClient(userId);
+        const user = await this.usersService.findById(userId);
+
+        // NOTE: demo đơn giản chưa add CC/BCC headers
+        const raw = this.buildRawEmail(user.email, data.to, data.subject, data.body);
+
+        const res = await gmail.users.messages.send({
+            userId: 'me',
+            requestBody: { raw },
+        });
+
+        return res.data.id;
+    }
+
+    async replyToEmail(userId: string, emailId: string, body: string, replyAll = false) {
+        const { messageId } = this.parseEmailId(emailId);
+        const gmail = await this.getGmailClient(userId);
+        const user = await this.usersService.findById(userId);
+
+        const original = await gmail.users.messages.get({
+            userId: 'me',
+            id: messageId,
+            format: 'metadata',
+            metadataHeaders: ['From', 'To', 'Cc', 'Subject', 'Message-ID', 'References'],
+        });
+
+        const headers = original.data.payload?.headers ?? [];
+        const fromRaw = this.getHeader(headers, 'From');
+        const toRaw = this.getHeader(headers, 'To');
+        const ccRaw = this.getHeader(headers, 'Cc');
+        const subjectRaw = this.getHeader(headers, 'Subject');
+        const messageIdHeader = this.getHeader(headers, 'Message-ID');
+        const referencesHeader = this.getHeader(headers, 'References');
+
+        const from = this.parseAddress(fromRaw);
+
+        let recipients: string[] = [];
+        if (replyAll) {
+            const all = [
+                from.email,
+                ...toRaw.split(',').map((s) => this.parseAddress(s.trim()).email),
+                ...ccRaw.split(',').map((s) => this.parseAddress(s.trim()).email),
+            ].filter(Boolean);
+
+            recipients = Array.from(new Set(all)).filter((e) => e && e !== user.email);
+        } else {
+            recipients = from.email ? [from.email] : [];
+        }
+
+        if (!recipients.length) throw new BadRequestException('No recipients for reply');
+
+        const subject = subjectRaw.startsWith('Re:') ? subjectRaw : `Re: ${subjectRaw}`;
+
+        const extraHeaders: Record<string, string> = {};
+        if (messageIdHeader) extraHeaders['In-Reply-To'] = messageIdHeader;
+        if (referencesHeader) extraHeaders['References'] = referencesHeader;
+        else if (messageIdHeader) extraHeaders['References'] = messageIdHeader;
+
+        const raw = this.buildRawEmail(user.email, recipients, subject, body, extraHeaders);
+
+        const res = await gmail.users.messages.send({
+            userId: 'me',
+            requestBody: {
+                raw,
+                threadId: original.data.threadId,
+            },
+        });
+
+        return res.data.id;
+    }
+
+    async modifyEmail(userId: string, emailId: string, actions: ModifyActions) {
+        const { messageId } = this.parseEmailId(emailId);
+        const gmail = await this.getGmailClient(userId);
+
+        if (actions.delete) {
+            await gmail.users.messages.trash({ userId: 'me', id: messageId });
+            return;
+        }
+
+        const addLabelIds: string[] = [];
+        const removeLabelIds: string[] = [];
+
+        if (actions.markRead) removeLabelIds.push('UNREAD');
+        if (actions.markUnread) addLabelIds.push('UNREAD');
+        if (actions.star) addLabelIds.push('STARRED');
+        if (actions.unstar) removeLabelIds.push('STARRED');
+
+        if (addLabelIds.length || removeLabelIds.length) {
+            await gmail.users.messages.modify({
+                userId: 'me',
+                id: messageId,
+                requestBody: { addLabelIds, removeLabelIds },
+            });
+        }
+    }
+
+    async getAttachment(userId: string, emailId: string, attachmentId: string) {
+        const { messageId } = this.parseEmailId(emailId);
+        const gmail = await this.getGmailClient(userId);
+
+        const att = await gmail.users.messages.attachments.get({
+            userId: 'me',
+            messageId,
+            id: attachmentId,
+        });
+
+        const data = att.data.data;
+        if (!data) throw new NotFoundException('Attachment not found');
+
+        const buffer = Buffer.from(
+            data.replace(/-/g, '+').replace(/_/g, '/'),
+            'base64',
+        );
+
+        // mimeType/filename phải lấy từ EmailDetail attachments list
+        return {
+            data: buffer,
+            mimeType: 'application/octet-stream',
+            filename: `attachment-${attachmentId}`,
+        };
+    }
+}

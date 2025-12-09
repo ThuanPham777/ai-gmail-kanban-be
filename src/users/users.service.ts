@@ -91,4 +91,25 @@ export class UsersService {
     return user;
   }
 
+  async updateGmailTokens(userId: string, data: { refreshToken: string; scope?: string }) {
+    await this.userModel.updateOne(
+      { _id: userId },
+      {
+        gmail: {
+          refreshToken: data.refreshToken,
+          scope: data.scope,
+          connectedAt: new Date(),
+        },
+      },
+    );
+  }
+
+  async getGmailRefreshToken(userId: string) {
+    const user = await this.userModel.findById(userId).select('gmail email');
+    if (!user?.gmail?.refreshToken) {
+      throw new UnauthorizedException('Gmail is not connected');
+    }
+    return { refreshToken: user.gmail.refreshToken, email: user.email };
+  }
+
 }
