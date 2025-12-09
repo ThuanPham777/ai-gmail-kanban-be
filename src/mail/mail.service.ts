@@ -67,9 +67,8 @@ export class MailService {
 
         const clientId = this.config.getOrThrow<string>('GOOGLE_CLIENT_ID');
         const clientSecret = this.config.getOrThrow<string>('GOOGLE_CLIENT_SECRET');
-        const redirectUri = this.config.getOrThrow<string>('GOOGLE_REDIRECT_URI');
 
-        const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+        const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret);
         oAuth2Client.setCredentials({ refresh_token: refreshToken });
 
         return google.gmail({ version: 'v1', auth: oAuth2Client });

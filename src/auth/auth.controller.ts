@@ -98,8 +98,6 @@ export class AuthController {
             scope: tokens.scope,
         });
 
-        console.log("user", user);
-
         return {
             status: 'success',
             message: 'Gmail connected successfully',
