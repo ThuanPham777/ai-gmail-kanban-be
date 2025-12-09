@@ -2,7 +2,6 @@ import {
     Injectable,
     BadRequestException,
     NotFoundException,
-    UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { google } from 'googleapis';
