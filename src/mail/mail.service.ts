@@ -53,11 +53,18 @@ export class MailService {
     }
 
     private parseEmailId(emailId: string) {
-        const [encodedMailbox, messageId] = emailId.split('|');
-        const mailboxId = decodeURIComponent(encodedMailbox ?? '');
-        if (!mailboxId || !messageId) {
-            throw new BadRequestException('Invalid email id');
+        // ✅ allow raw gmail message id
+        if (!emailId.includes("|")) {
+            return { mailboxId: "INBOX", messageId: emailId };
         }
+
+        const [encodedMailbox, messageId] = emailId.split("|");
+        const mailboxId = decodeURIComponent(encodedMailbox ?? "");
+
+        if (!mailboxId || !messageId) {
+            throw new BadRequestException("Invalid email id");
+        }
+
         return { mailboxId, messageId };
     }
 
