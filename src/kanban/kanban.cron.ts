@@ -9,6 +9,12 @@ export class KanbanCron {
   // chạy mỗi 5 phút để wake snoozed emails (reduced frequency to save memory)
   @Cron('*/5 * * * *')
   async wake() {
+    // Allow disabling cron via env for constrained hosts
+    if (process.env.DISABLE_CRON === 'true') {
+      console.log('[Cron] Disabled via DISABLE_CRON=true');
+      return;
+    }
+
     try {
       const result = await this.kanban.wakeExpiredSnoozed();
       if (result.woke > 0) {

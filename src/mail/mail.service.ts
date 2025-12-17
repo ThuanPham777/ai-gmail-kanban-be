@@ -206,38 +206,53 @@ export class MailService {
     const msgs = list.data.messages ?? [];
     const data: EmailListItem[] = [];
 
-    for (const m of msgs) {
-      if (!m.id) continue;
+    // Process message details in small parallel batches to limit concurrent memory
+    const batchSize = 5;
+    for (let i = 0; i < msgs.length; i += batchSize) {
+      const batch = msgs.slice(i, i + batchSize);
+      const details = await Promise.all(
+        batch.map((m) =>
+          m.id
+            ? gmail.users.messages
+                .get({
+                  userId: 'me',
+                  id: m.id,
+                  format: 'metadata',
+                  metadataHeaders: ['From', 'Subject', 'Date'],
+                })
+                .catch(() => null)
+            : Promise.resolve(null),
+        ),
+      );
 
-      const detail = await gmail.users.messages.get({
-        userId: 'me',
-        id: m.id,
-        format: 'metadata',
-        metadataHeaders: ['From', 'Subject', 'Date'],
-      });
+      for (let j = 0; j < batch.length; j++) {
+        const m = batch[j];
+        const detail = details[j];
+        if (!m.id || !detail) continue;
 
-      const headers = detail.data.payload?.headers ?? [];
-      const fromRaw = this.getHeader(headers, 'From');
-      const subject = this.getHeader(headers, 'Subject') || '(No subject)';
-      const dateRaw = this.getHeader(headers, 'Date');
+        const headers = detail.data.payload?.headers ?? [];
+        const fromRaw = this.getHeader(headers, 'From');
+        const subject = this.getHeader(headers, 'Subject') || '(No subject)';
+        const dateRaw = this.getHeader(headers, 'Date');
 
-      const from = this.parseAddress(fromRaw);
-      const labelIds = detail.data.labelIds ?? [];
+        const from = this.parseAddress(fromRaw);
+        const labelIds = detail.data.labelIds ?? [];
 
-      data.push({
-        id: this.composeEmailId(mailboxId, m.id),
-        mailboxId,
-        senderName: from.name,
-        senderEmail: from.email,
-        subject,
-        preview: subject,
-        timestamp: dateRaw
-          ? new Date(dateRaw).toISOString()
-          : new Date().toISOString(),
-        starred: labelIds.includes('STARRED'),
-        unread: labelIds.includes('UNREAD'),
-        important: labelIds.includes('IMPORTANT'),
-      });
+        data.push({
+          id: this.composeEmailId(mailboxId, m.id),
+          mailboxId,
+          senderName: from.name,
+          senderEmail: from.email,
+          subject,
+          preview: subject,
+          timestamp: dateRaw
+            ? new Date(dateRaw).toISOString()
+            : new Date().toISOString(),
+          starred: labelIds.includes('STARRED'),
+          unread: labelIds.includes('UNREAD'),
+          important: labelIds.includes('IMPORTANT'),
+        });
+      }
     }
 
     return {
@@ -259,19 +274,21 @@ export class MailService {
     pageSize = 20,
   ) {
     const gmail = await this.getGmailClient(userId);
-    const safePage = page > 0 ? page : 1;
+    const safePage = Math.min(Math.max(page, 1), 5); // cap to 5 pages to avoid deep traversal
     const safeSize = Math.min(Math.max(pageSize, 1), 50);
 
-    // duyệt pageToken tuần tự tới page cần lấy
+    // traverse pageToken sequentially but cap at safePage to avoid large memory
     let pageToken: string | undefined = undefined;
     for (let i = 1; i < safePage; i++) {
-      const step = await gmail.users.messages.list({
-        userId: 'me',
-        labelIds: [mailboxId],
-        maxResults: safeSize,
-        pageToken,
-      });
-      pageToken = step.data.nextPageToken ?? undefined;
+      const step = await gmail.users.messages
+        .list({
+          userId: 'me',
+          labelIds: [mailboxId],
+          maxResults: safeSize,
+          pageToken,
+        })
+        .catch(() => null);
+      pageToken = step?.data?.nextPageToken ?? undefined;
       if (!pageToken) break;
     }
 
@@ -285,44 +302,60 @@ export class MailService {
     const msgs = list.data.messages ?? [];
 
     const data: EmailListItem[] = [];
-    for (const m of msgs) {
-      if (!m.id) continue;
 
-      const detail = await gmail.users.messages.get({
-        userId: 'me',
-        id: m.id,
-        format: 'metadata',
-        metadataHeaders: ['From', 'Subject', 'Date'],
-      });
+    // Process details in small batches to limit memory
+    const batchSize = 5;
+    for (let i = 0; i < msgs.length; i += batchSize) {
+      const batch = msgs.slice(i, i + batchSize);
+      const details = await Promise.all(
+        batch.map((m) =>
+          m.id
+            ? gmail.users.messages
+                .get({
+                  userId: 'me',
+                  id: m.id,
+                  format: 'metadata',
+                  metadataHeaders: ['From', 'Subject', 'Date'],
+                })
+                .catch(() => null)
+            : Promise.resolve(null),
+        ),
+      );
 
-      const headers = detail.data.payload?.headers ?? [];
-      const fromRaw = this.getHeader(headers, 'From');
-      const subject = this.getHeader(headers, 'Subject') || '(No subject)';
-      const dateRaw = this.getHeader(headers, 'Date');
+      for (let j = 0; j < batch.length; j++) {
+        const m = batch[j];
+        const detail = details[j];
+        if (!m.id || !detail) continue;
 
-      const from = this.parseAddress(fromRaw);
-      const labelIds = detail.data.labelIds ?? [];
+        const headers = detail.data.payload?.headers ?? [];
+        const fromRaw = this.getHeader(headers, 'From');
+        const subject = this.getHeader(headers, 'Subject') || '(No subject)';
+        const dateRaw = this.getHeader(headers, 'Date');
 
-      data.push({
-        id: this.composeEmailId(mailboxId, m.id),
-        mailboxId,
-        senderName: from.name,
-        senderEmail: from.email,
-        subject,
-        preview: subject,
-        timestamp: dateRaw
-          ? new Date(dateRaw).toISOString()
-          : new Date().toISOString(),
-        starred: labelIds.includes('STARRED'),
-        unread: labelIds.includes('UNREAD'),
-        important: labelIds.includes('IMPORTANT'),
-      });
+        const from = this.parseAddress(fromRaw);
+        const labelIds = detail.data.labelIds ?? [];
+
+        data.push({
+          id: this.composeEmailId(mailboxId, m.id),
+          mailboxId,
+          senderName: from.name,
+          senderEmail: from.email,
+          subject,
+          preview: subject,
+          timestamp: dateRaw
+            ? new Date(dateRaw).toISOString()
+            : new Date().toISOString(),
+          starred: labelIds.includes('STARRED'),
+          unread: labelIds.includes('UNREAD'),
+          important: labelIds.includes('IMPORTANT'),
+        });
+      }
     }
 
     return {
       data,
       meta: {
-        total: undefined, // Gmail API không trả total theo label dễ dàng
+        total: undefined, // Gmail API doesn't return total per label
         page: safePage,
         pageSize: safeSize,
         nextPageToken: list.data.nextPageToken ?? null,
