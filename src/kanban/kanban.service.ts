@@ -13,6 +13,7 @@ import {
   EmailItemDocument,
   EmailStatus,
 } from './schemas/email-item.chema';
+import { KanbanColumnConfig } from '../users/schemas/user-settings.schema';
 import { AiService } from 'src/ai/ai.service';
 import { QdrantService } from 'src/ai/qdrant.service';
 import Fuse from 'fuse.js';
@@ -387,14 +388,15 @@ export class KanbanService {
 
     const uid = new Types.ObjectId(userId);
 
+    // Get user's column configuration
+    const columns = await this.getKanbanColumns(userId);
+    const statuses = columns.map((col) => col.id);
+
     // Decode pageToken to get skip offset for each column
-    let skipMap: Record<EmailStatus, number> = {
-      [EmailStatus.INBOX]: 0,
-      [EmailStatus.TODO]: 0,
-      [EmailStatus.IN_PROGRESS]: 0,
-      [EmailStatus.DONE]: 0,
-      [EmailStatus.SNOOZED]: 0,
-    };
+    let skipMap: Record<string, number> = {};
+    statuses.forEach((status) => {
+      skipMap[status] = 0;
+    });
 
     if (pageToken) {
       try {
@@ -408,7 +410,7 @@ export class KanbanService {
 
     // Get total counts for each status
     const totals = await Promise.all(
-      Object.values(EmailStatus).map(async (status) => ({
+      statuses.map(async (status) => ({
         status,
         count: await this.emailItemModel.countDocuments({
           userId: uid,
@@ -419,12 +421,12 @@ export class KanbanService {
 
     const totalMap = totals.reduce(
       (acc, { status, count }) => ({ ...acc, [status]: count }),
-      {} as Record<EmailStatus, number>,
+      {} as Record<string, number>,
     );
 
     // Fetch paginated items for each column
     const columnData = await Promise.all(
-      Object.values(EmailStatus).map(async (status) => {
+      statuses.map(async (status) => {
         const items = await this.emailItemModel
           .find({ userId: uid, status })
           .sort({ updatedAt: -1 })
@@ -438,23 +440,23 @@ export class KanbanService {
 
     const data = columnData.reduce(
       (acc, { status, items }) => ({ ...acc, [status]: items }),
-      {} as Record<EmailStatus, any[]>,
+      {} as Record<string, any[]>,
     );
 
     // Check if there are more items for any column
-    const hasMore = Object.values(EmailStatus).some(
+    const hasMore = statuses.some(
       (status) => (skipMap[status] || 0) + pageSize < totalMap[status],
     );
 
     // Generate next page token
     let nextPageToken: string | null = null;
     if (hasMore) {
-      const nextSkipMap = Object.values(EmailStatus).reduce(
+      const nextSkipMap = statuses.reduce(
         (acc, status) => ({
           ...acc,
           [status]: (skipMap[status] || 0) + pageSize,
         }),
-        {} as Record<EmailStatus, number>,
+        {} as Record<string, number>,
       );
       nextPageToken = Buffer.from(JSON.stringify(nextSkipMap)).toString(
         'base64',
@@ -469,10 +471,16 @@ export class KanbanService {
         hasMore,
         total: totalMap,
       },
+      columns, // Include column configuration in response
     };
   }
 
-  async updateStatus(userId: string, messageId: string, status: EmailStatus) {
+  async updateStatus(
+    userId: string,
+    messageId: string,
+    status: EmailStatus,
+    gmailLabel?: string,
+  ) {
     const uid = new Types.ObjectId(userId);
 
     const updated = await this.emailItemModel.findOneAndUpdate(
@@ -482,6 +490,30 @@ export class KanbanService {
     );
 
     if (!updated) throw new NotFoundException('Email item not found');
+
+    // Sync with Gmail labels if gmailLabel is provided
+    if (gmailLabel) {
+      try {
+        const gmail = await this.getGmailClient(userId);
+
+        // Add the new label to the message
+        await gmail.users.messages.modify({
+          userId: 'me',
+          id: messageId,
+          requestBody: {
+            addLabelIds: [gmailLabel],
+          },
+        });
+
+        console.log(
+          `[Gmail Sync] Added label ${gmailLabel} to message ${messageId}`,
+        );
+      } catch (error) {
+        console.error(`[Gmail Sync] Failed to add label:`, error);
+        // Don't fail the whole operation if Gmail sync fails
+      }
+    }
+
     return updated;
   }
 
@@ -591,5 +623,16 @@ export class KanbanService {
     await this.emailItemModel.bulkWrite(bulkOps);
 
     return { woke: items.length };
+  }
+
+  async getKanbanColumns(userId: string): Promise<KanbanColumnConfig[]> {
+    return this.usersService.getKanbanColumns(userId);
+  }
+
+  async updateKanbanColumns(
+    userId: string,
+    columns: KanbanColumnConfig[],
+  ): Promise<KanbanColumnConfig[]> {
+    return this.usersService.updateKanbanColumns(userId, columns);
   }
 }

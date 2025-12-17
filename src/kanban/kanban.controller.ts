@@ -100,13 +100,14 @@ export class KanbanController {
   async updateStatus(
     @Req() req: Request,
     @Param('messageId') messageId: string,
-    @Body() body: { status: EmailStatus },
+    @Body() body: { status: EmailStatus; gmailLabel?: string },
   ) {
     const userId = this.getUserId(req);
     const updated = await this.kanban.updateStatus(
       userId,
       messageId,
       body.status,
+      body.gmailLabel,
     );
     return { status: 'success', data: updated };
   }
@@ -127,5 +128,19 @@ export class KanbanController {
     const userId = this.getUserId(req);
     const result = await this.kanban.summarize(userId, messageId);
     return { status: 'success', data: result };
+  }
+
+  @Get('columns')
+  async getColumns(@Req() req: Request) {
+    const userId = this.getUserId(req);
+    const columns = await this.kanban.getKanbanColumns(userId);
+    return { status: 'success', data: columns };
+  }
+
+  @Post('columns')
+  async updateColumns(@Req() req: Request, @Body() body: { columns: any[] }) {
+    const userId = this.getUserId(req);
+    const columns = await this.kanban.updateKanbanColumns(userId, body.columns);
+    return { status: 'success', data: columns };
   }
 }
