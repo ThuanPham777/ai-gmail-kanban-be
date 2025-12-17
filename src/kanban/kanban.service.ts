@@ -78,7 +78,11 @@ export class KanbanService {
 
     // map to items with score and return sorted by score asc (best matches first)
     return results
-      .map((r) => ({ ...(r.item as any), _score: r.score ?? 0 }))
+      .map((r) => ({
+        ...(r.item as any),
+        hasAttachments: (r.item as any).hasAttachments ?? false,
+        _score: r.score ?? 0,
+      }))
       .sort((a, b) => (a._score ?? 0) - (b._score ?? 0));
   }
 
@@ -111,7 +115,7 @@ export class KanbanService {
           messageId: { $in: messageIds },
         })
         .select(
-          'messageId subject senderName senderEmail snippet summary status',
+          'messageId subject senderName senderEmail snippet summary status hasAttachments',
         )
         .lean()
         .exec();
@@ -125,6 +129,7 @@ export class KanbanService {
         if (item) {
           enriched.push({
             ...item,
+            hasAttachments: item.hasAttachments ?? false,
             _score: result.score,
             _searchType: 'semantic',
           });
@@ -434,7 +439,13 @@ export class KanbanService {
           .limit(pageSize)
           .lean();
 
-        return { status, items };
+        // Ensure hasAttachments is always a boolean (default to false if undefined)
+        const itemsWithAttachments = items.map((item) => ({
+          ...item,
+          hasAttachments: item.hasAttachments ?? false,
+        }));
+
+        return { status, items: itemsWithAttachments };
       }),
     );
 
