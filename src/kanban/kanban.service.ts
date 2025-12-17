@@ -288,6 +288,7 @@ export class KanbanService {
   /**
    * Đồng bộ tối thiểu: lấy list Gmail messages theo label,
    * upsert vào email_items để phục vụ Kanban.
+   * Always detects attachments for filtering support.
    */
   async syncLabelToItems(userId: string, labelId = 'INBOX', maxResults = 30) {
     const gmail = await this.getGmailClient(userId);
@@ -304,17 +305,38 @@ export class KanbanService {
     for (const m of msgs) {
       if (!m.id) continue;
 
-      const detail = await gmail.users.messages.get({
-        userId: 'me',
-        id: m.id,
-        format: 'metadata',
-        metadataHeaders: ['From', 'Subject', 'Date'],
-      });
+      const detail = await gmail.users.messages
+        .get({
+          userId: 'me',
+          id: m.id,
+          format: 'full',
+        })
+        .catch(() => null);
+
+      if (!detail) continue;
 
       const headers = detail.data.payload?.headers ?? [];
       const fromRaw = this.getHeader(headers, 'From');
       const subject = this.getHeader(headers, 'Subject') || '(No subject)';
       const from = this.parseAddress(fromRaw);
+
+      // Detect attachments if requested (walk payload)
+      let hasAttachments = false;
+      try {
+        const walk = (node: any): boolean => {
+          if (!node) return false;
+          if (node.filename) return true;
+          if (node.body && node.body.attachmentId) return true;
+          if (node.parts && Array.isArray(node.parts)) {
+            return node.parts.some((p: any) => walk(p));
+          }
+          return false;
+        };
+
+        hasAttachments = walk(detail.data.payload);
+      } catch (e) {
+        hasAttachments = false;
+      }
 
       const result = await this.emailItemModel.updateOne(
         { userId: uid, messageId: m.id },
@@ -332,6 +354,7 @@ export class KanbanService {
             subject,
             snippet: subject,
             threadId: detail.data.threadId,
+            hasAttachments,
           },
         },
         { upsert: true },

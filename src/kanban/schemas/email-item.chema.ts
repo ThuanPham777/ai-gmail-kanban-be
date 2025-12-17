@@ -46,6 +46,9 @@ export class EmailItem {
   @Prop() summary?: string;
   @Prop() lastSummarizedAt?: Date;
 
+  // Whether the message has attachments (set during sync or when fetching details)
+  @Prop() hasAttachments?: boolean;
+
   // Embedding metadata
   @Prop() hasEmbedding?: boolean;
   @Prop() embeddingGeneratedAt?: Date;
