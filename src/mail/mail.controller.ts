@@ -14,7 +14,12 @@ import { MailService } from './mail.service';
 import { JwtAuthGuard } from 'src/auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { CurrentUserData } from '../common/decorators/current-user.decorator';
-import { SendEmailDto, ReplyEmailDto, ModifyEmailDto } from './dtos/request';
+import {
+  SendEmailDto,
+  ReplyEmailDto,
+  ModifyEmailDto,
+  ForwardEmailDto,
+} from './dtos/request';
 import {
   MailboxesResponseDto,
   EmailListResponseDto,
@@ -114,6 +119,19 @@ export class MailController {
     );
     const response = SendEmailResponseDto.create(messageId);
     return ApiResponseDto.success(response, 'Reply sent successfully');
+  }
+
+  @Post('emails/:id/forward')
+  async forwardEmail(
+    @CurrentUser() user: CurrentUserData,
+    @Param('id') emailId: string,
+    @Body() dto: ForwardEmailDto,
+  ): Promise<ApiResponseDto<SendEmailResponseDto>> {
+    if (!user?.userId) throw new BadRequestException('User not authenticated');
+
+    const messageId = await this.mail.forwardEmail(user.userId, emailId, dto);
+    const response = SendEmailResponseDto.create(messageId);
+    return ApiResponseDto.success(response, 'Email forwarded successfully');
   }
 
   @Post('emails/:id/modify')

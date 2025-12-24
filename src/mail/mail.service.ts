@@ -452,6 +452,28 @@ export class MailService {
       .replace(/=+$/g, '');
   }
 
+  private buildForwardedHtml(original: EmailDetail) {
+    const date = original.timestamp
+      ? new Date(original.timestamp).toISOString()
+      : new Date().toISOString();
+
+    const toLine = original.to?.length ? original.to.join(', ') : '';
+    const ccLine = original.cc?.length ? original.cc.join(', ') : '';
+
+    const headerLines = [
+      '<p>---------- Forwarded message ---------</p>',
+      `<p><b>From:</b> ${original.senderName} &lt;${original.senderEmail}&gt;</p>`,
+      `<p><b>Date:</b> ${date}</p>`,
+      `<p><b>Subject:</b> ${original.subject}</p>`,
+      toLine ? `<p><b>To:</b> ${toLine}</p>` : '',
+      ccLine ? `<p><b>Cc:</b> ${ccLine}</p>` : '',
+    ]
+      .filter(Boolean)
+      .join('');
+
+    return `${headerLines}<blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">${original.body}</blockquote>`;
+  }
+
   async sendEmail(
     userId: string,
     data: {
@@ -468,12 +490,65 @@ export class MailService {
     const gmail = await this.getGmailClient(userId);
     const user = await this.usersService.findById(userId);
 
-    // NOTE: demo đơn giản chưa add CC/BCC headers
+    const extraHeaders: Record<string, string> = {};
+    if (data.cc?.length) extraHeaders['Cc'] = data.cc.join(', ');
+    if (data.bcc?.length) extraHeaders['Bcc'] = data.bcc.join(', ');
+
     const raw = this.buildRawEmail(
       user.email,
       data.to,
       data.subject,
       data.body,
+      Object.keys(extraHeaders).length ? extraHeaders : undefined,
+    );
+
+    const res = await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: { raw },
+    });
+
+    return res.data.id;
+  }
+
+  async forwardEmail(
+    userId: string,
+    emailId: string,
+    data: {
+      to: string[];
+      subject?: string;
+      body?: string;
+      cc?: string[];
+      bcc?: string[];
+    },
+  ) {
+    if (!data.to?.length)
+      throw new BadRequestException('At least one recipient is required');
+
+    const gmail = await this.getGmailClient(userId);
+    const user = await this.usersService.findById(userId);
+
+    const original = await this.getEmailById(userId, emailId);
+
+    const baseSubject = original.subject || '(No subject)';
+    const defaultSubject = baseSubject.startsWith('Fwd:')
+      ? baseSubject
+      : `Fwd: ${baseSubject}`;
+    const subject = (data.subject || '').trim() || defaultSubject;
+
+    const note = (data.body || '').trim();
+    const forwarded = this.buildForwardedHtml(original);
+    const html = note ? `${note}<br/><br/>${forwarded}` : forwarded;
+
+    const extraHeaders: Record<string, string> = {};
+    if (data.cc?.length) extraHeaders['Cc'] = data.cc.join(', ');
+    if (data.bcc?.length) extraHeaders['Bcc'] = data.bcc.join(', ');
+
+    const raw = this.buildRawEmail(
+      user.email,
+      data.to,
+      subject,
+      html,
+      Object.keys(extraHeaders).length ? extraHeaders : undefined,
     );
 
     const res = await gmail.users.messages.send({
