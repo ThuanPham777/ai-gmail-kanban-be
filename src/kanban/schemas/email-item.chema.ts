@@ -3,12 +3,20 @@ import { Document, Types } from 'mongoose';
 
 export type EmailItemDocument = EmailItem & Document;
 
+/**
+ * Built-in email status constants.
+ * Note: The 'status' field accepts ANY string (for dynamic columns),
+ * but these constants are used for:
+ * - SNOOZED functionality (special status, not a column)
+ * - Default values
+ * - Built-in column IDs
+ */
 export enum EmailStatus {
   INBOX = 'INBOX',
   TODO = 'TODO',
   IN_PROGRESS = 'IN_PROGRESS',
   DONE = 'DONE',
-  SNOOZED = 'SNOOZED',
+  SNOOZED = 'SNOOZED', // Special: temporary status for snoozed emails
 }
 
 @Schema({ timestamps: true, collection: 'email_items' })
@@ -34,11 +42,13 @@ export class EmailItem {
   @Prop() snippet?: string;
   @Prop() threadId?: string;
 
-  @Prop({ enum: EmailStatus, default: EmailStatus.INBOX, index: true })
-  status: EmailStatus;
+  // Kanban column id. Historically this was limited to EmailStatus enum,
+  // but for dynamic column configuration we allow any string.
+  @Prop({ type: String, default: EmailStatus.INBOX, index: true })
+  status: string;
 
-  @Prop({ enum: EmailStatus })
-  originalStatus?: EmailStatus;
+  @Prop({ type: String })
+  originalStatus?: string;
 
   @Prop({ type: Date, index: true })
   snoozeUntil?: Date;

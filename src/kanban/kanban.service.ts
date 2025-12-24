@@ -44,6 +44,132 @@ export class KanbanService {
   }
 
   /**
+   * Fetch all available Gmail labels for autocomplete
+   * Returns both system and user-created labels
+   */
+  async getAvailableGmailLabels(userId: string) {
+    try {
+      const gmail = await this.getGmailClient(userId);
+      const response = await gmail.users.labels.list({ userId: 'me' });
+      const labels = (response.data.labels ?? []) as Array<{
+        id?: string;
+        name?: string;
+        type?: string;
+      }>;
+
+      const processedLabels = labels
+        .filter((l) => l.id && l.name)
+        .map((l) => ({
+          id: l.id!,
+          name: l.name!,
+          type: l.type || 'user',
+        }));
+
+      // Ensure all common system labels are included (Gmail API might not return all)
+      const systemLabels = [
+        'INBOX',
+        'STARRED',
+        'IMPORTANT',
+        'SENT',
+        'DRAFT',
+        'TRASH',
+        'SPAM',
+        'UNREAD',
+      ];
+
+      const existingLabelNames = new Set(
+        processedLabels.map((l) => l.name.toUpperCase()),
+      );
+
+      // Add missing system labels
+      for (const sysLabel of systemLabels) {
+        if (!existingLabelNames.has(sysLabel)) {
+          processedLabels.push({
+            id: sysLabel,
+            name: sysLabel,
+            type: 'system',
+          });
+        }
+      }
+
+      return processedLabels.sort((a, b) => {
+        // System labels first, then alphabetically
+        if (a.type === 'system' && b.type !== 'system') return -1;
+        if (a.type !== 'system' && b.type === 'system') return 1;
+        return a.name.localeCompare(b.name);
+      });
+    } catch (error) {
+      console.error('[Gmail Labels] Failed to fetch labels:', error);
+      throw new InternalServerErrorException('Failed to fetch Gmail labels');
+    }
+  }
+
+  /**
+   * Validate if a Gmail label exists
+   * Returns { valid: boolean, suggestion?: string }
+   */
+  async validateGmailLabel(userId: string, labelName: string) {
+    if (!labelName.trim()) {
+      return {
+        valid: true,
+        message: 'Empty label (Archive column - removes INBOX)',
+      };
+    }
+
+    try {
+      const labels = await this.getAvailableGmailLabels(userId);
+      const labelMap = new Map(labels.map((l) => [l.name.toLowerCase(), l]));
+
+      const systemLabelIds = new Set([
+        'INBOX',
+        'STARRED',
+        'IMPORTANT',
+        'SENT',
+        'DRAFT',
+        'TRASH',
+        'SPAM',
+        'UNREAD',
+      ]);
+
+      const trimmed = labelName.trim();
+
+      // Check if it's a system label
+      if (systemLabelIds.has(trimmed)) {
+        return { valid: true, message: `System label: ${trimmed}` };
+      }
+
+      // Check if label exists (case-insensitive)
+      const found = labelMap.get(trimmed.toLowerCase());
+      if (found) {
+        return {
+          valid: true,
+          message: `Label exists: ${found.name}`,
+          actualName: found.name,
+        };
+      }
+
+      // Label doesn't exist - find similar labels for suggestions
+      const similar = labels
+        .filter((l) => l.name.toLowerCase().includes(trimmed.toLowerCase()))
+        .slice(0, 3);
+
+      return {
+        valid: false,
+        message: `Label "${trimmed}" not found in Gmail`,
+        suggestions: similar.length ? similar.map((l) => l.name) : undefined,
+        hint: 'The label will be used as-is. Create it in Gmail first for best results.',
+      };
+    } catch (error) {
+      console.error('[Gmail Label Validation] Error:', error);
+      return {
+        valid: false,
+        message: 'Failed to validate label',
+        hint: 'The label will be used as-is.',
+      };
+    }
+  }
+
+  /**
    * Fuzzy search email items for a user across subject, sender name/email, snippet, summary.
    * Supports typo tolerance and partial matches.
    */
@@ -308,18 +434,31 @@ export class KanbanService {
    * Đồng bộ tối thiểu: lấy list Gmail messages theo label,
    * upsert vào email_items để phục vụ Kanban.
    * Always detects attachments for filtering support.
+   * @param specificMessageId - If provided, only sync this specific message
    */
-  async syncLabelToItems(userId: string, labelId = 'INBOX', maxResults = 30) {
+  async syncLabelToItems(
+    userId: string,
+    labelId = 'INBOX',
+    maxResults = 30,
+    specificMessageId?: string,
+  ) {
     const gmail = await this.getGmailClient(userId);
-
-    const list = await gmail.users.messages.list({
-      userId: 'me',
-      labelIds: [labelId],
-      maxResults,
-    });
-
-    const msgs = list.data.messages ?? [];
     const uid = new Types.ObjectId(userId);
+
+    let msgs: Array<{ id?: string | null }> = [];
+
+    if (specificMessageId) {
+      // Fetch specific message
+      msgs = [{ id: specificMessageId }];
+    } else {
+      // Fetch message list by label
+      const list = await gmail.users.messages.list({
+        userId: 'me',
+        labelIds: [labelId],
+        maxResults,
+      });
+      msgs = list.data.messages ?? [];
+    }
 
     for (const m of msgs) {
       if (!m.id) continue;
@@ -397,23 +536,55 @@ export class KanbanService {
     pageToken?: string,
     pageSize: number = 20,
   ) {
-    // Optional sync khi mở board lần đầu
-    if (labelId) {
-      await this.syncLabelToItems(userId, labelId, 5);
-    } else {
-      await this.syncLabelToItems(userId, 'INBOX', 5);
-    }
-
     const uid = new Types.ObjectId(userId);
+    const gmail = await this.getGmailClient(userId);
 
     // Get user's column configuration
     const columns = await this.getKanbanColumns(userId);
-    const statuses = columns.map((col) => col.id);
+
+    // Fetch all Gmail labels for resolution
+    const labelList = await gmail.users.labels.list({ userId: 'me' });
+    const labels = (labelList.data.labels ?? []) as Array<{
+      id?: string;
+      name?: string;
+      type?: string;
+    }>;
+    const nameToId = new Map(
+      labels
+        .filter((l) => l.name && l.id)
+        .map((l) => [String(l.name).toLowerCase(), String(l.id)]),
+    );
+
+    const systemLabelIds = new Set([
+      'INBOX',
+      'STARRED',
+      'IMPORTANT',
+      'SENT',
+      'DRAFT',
+      'TRASH',
+      'SPAM',
+      'UNREAD',
+    ]);
+
+    // Resolve label name -> label id
+    const resolveLabelId = (value: string) => {
+      const v = value.trim();
+      if (!v) return '';
+      if (systemLabelIds.has(v)) return v;
+      if (/^Label_/.test(v)) return v;
+      const resolved = nameToId.get(v.toLowerCase());
+      if (!resolved) {
+        console.warn(
+          `[Kanban getBoard] Label "${v}" not found in Gmail. Skipping column.`,
+        );
+      }
+      return resolved ?? '';
+    };
 
     // Decode pageToken to get skip offset for each column
     let skipMap: Record<string, number> = {};
-    statuses.forEach((status) => {
-      skipMap[status] = 0;
+    columns.forEach((col) => {
+      skipMap[col.id] = 0;
     });
 
     if (pageToken) {
@@ -426,39 +597,92 @@ export class KanbanService {
       }
     }
 
-    // Get total counts for each status
-    const totals = await Promise.all(
-      statuses.map(async (status) => ({
-        status,
-        count: await this.emailItemModel.countDocuments({
-          userId: uid,
-          status,
-        }),
-      })),
-    );
-
-    const totalMap = totals.reduce(
-      (acc, { status, count }) => ({ ...acc, [status]: count }),
-      {} as Record<string, number>,
-    );
-
-    // Fetch paginated items for each column
+    // Fetch emails from Gmail based on each column's gmailLabel
     const columnData = await Promise.all(
-      statuses.map(async (status) => {
-        const items = await this.emailItemModel
-          .find({ userId: uid, status })
-          .sort({ updatedAt: -1 })
-          .skip(skipMap[status] || 0)
-          .limit(pageSize)
-          .lean();
+      columns.map(async (col) => {
+        const gmailLabelId = col.gmailLabel
+          ? resolveLabelId(col.gmailLabel)
+          : '';
 
-        // Ensure hasAttachments is always a boolean (default to false if undefined)
-        const itemsWithAttachments = items.map((item) => ({
-          ...item,
-          hasAttachments: item.hasAttachments ?? false,
-        }));
+        // Skip columns without valid Gmail labels (e.g., Archive with empty label)
+        if (!gmailLabelId) {
+          console.log(
+            `[Kanban getBoard] Column "${col.name}" has no Gmail label. Showing no cards.`,
+          );
+          return {
+            status: col.id,
+            items: [],
+            total: 0,
+            warning: col.gmailLabel
+              ? `Gmail label "${col.gmailLabel}" not found. Please update column settings.`
+              : undefined,
+          };
+        }
 
-        return { status, items: itemsWithAttachments };
+        try {
+          // Fetch message IDs from Gmail for this label
+          const response = await gmail.users.messages.list({
+            userId: 'me',
+            labelIds: [gmailLabelId],
+            maxResults: (skipMap[col.id] || 0) + pageSize,
+          });
+
+          const messages = response.data.messages || [];
+
+          // Apply pagination (skip already fetched items)
+          const skip = skipMap[col.id] || 0;
+          const paginatedMessages = messages.slice(skip, skip + pageSize);
+
+          // Fetch email details from MongoDB (or sync if missing)
+          const items = await Promise.all(
+            paginatedMessages.map(async (msg) => {
+              let item = await this.emailItemModel
+                .findOne({ userId: uid, messageId: msg.id })
+                .lean();
+
+              // If not in MongoDB, sync it first
+              if (!item) {
+                await this.syncLabelToItems(userId, gmailLabelId, 1, msg.id);
+                item = await this.emailItemModel
+                  .findOne({ userId: uid, messageId: msg.id })
+                  .lean();
+              }
+
+              // Ensure status matches column ID
+              if (item && item.status !== col.id) {
+                await this.emailItemModel.updateOne(
+                  { userId: uid, messageId: msg.id },
+                  { $set: { status: col.id } },
+                );
+                item.status = col.id;
+              }
+
+              return item
+                ? {
+                    ...item,
+                    hasAttachments: item.hasAttachments ?? false,
+                  }
+                : null;
+            }),
+          );
+
+          return {
+            status: col.id,
+            items: items.filter((i) => i !== null),
+            total: messages.length, // Total count from Gmail
+          };
+        } catch (error) {
+          console.error(
+            `[Kanban getBoard] Failed to fetch Gmail messages for label ${gmailLabelId}:`,
+            error,
+          );
+          return {
+            status: col.id,
+            items: [],
+            total: 0,
+            error: `Failed to fetch emails for label "${col.gmailLabel}". Please check label exists in Gmail.`,
+          };
+        }
       }),
     );
 
@@ -467,18 +691,32 @@ export class KanbanService {
       {} as Record<string, any[]>,
     );
 
+    const totalMap = columnData.reduce(
+      (acc, { status, total }) => ({ ...acc, [status]: total }),
+      {} as Record<string, number>,
+    );
+
+    // Collect warnings and errors from columns
+    const warnings = columnData
+      .filter((col) => col.warning || col.error)
+      .map((col) => ({
+        columnId: col.status,
+        message: col.warning || col.error,
+        type: col.error ? 'error' : 'warning',
+      }));
+
     // Check if there are more items for any column
-    const hasMore = statuses.some(
-      (status) => (skipMap[status] || 0) + pageSize < totalMap[status],
+    const hasMore = columns.some(
+      (col) => (skipMap[col.id] || 0) + pageSize < totalMap[col.id],
     );
 
     // Generate next page token
     let nextPageToken: string | null = null;
     if (hasMore) {
-      const nextSkipMap = statuses.reduce(
-        (acc, status) => ({
+      const nextSkipMap = columns.reduce(
+        (acc, col) => ({
           ...acc,
-          [status]: (skipMap[status] || 0) + pageSize,
+          [col.id]: (skipMap[col.id] || 0) + pageSize,
         }),
         {} as Record<string, number>,
       );
@@ -496,13 +734,14 @@ export class KanbanService {
         total: totalMap,
       },
       columns, // Include column configuration in response
+      warnings: warnings.length > 0 ? warnings : undefined, // Include warnings if any
     };
   }
 
   async updateStatus(
     userId: string,
     messageId: string,
-    status: EmailStatus,
+    status: string,
     gmailLabel?: string,
   ) {
     const uid = new Types.ObjectId(userId);
@@ -515,25 +754,88 @@ export class KanbanService {
 
     if (!updated) throw new NotFoundException('Email item not found');
 
-    // Sync with Gmail labels if gmailLabel is provided
-    if (gmailLabel) {
+    // Sync with Gmail labels (gmailLabel can be provided, empty string for archive, or undefined to skip)
+    if (gmailLabel !== undefined) {
       try {
         const gmail = await this.getGmailClient(userId);
 
-        // Add the new label to the message
+        // Resolve label name -> label id when needed
+        const labelList = await gmail.users.labels.list({ userId: 'me' });
+        const labels = (labelList.data.labels ?? []) as Array<{
+          id?: string;
+          name?: string;
+          type?: string;
+        }>;
+        const nameToId = new Map(
+          labels
+            .filter((l) => l.name && l.id)
+            .map((l) => [String(l.name).toLowerCase(), String(l.id)]),
+        );
+
+        const systemLabelIds = new Set([
+          'INBOX',
+          'STARRED',
+          'IMPORTANT',
+          'SENT',
+          'DRAFT',
+          'TRASH',
+          'SPAM',
+          'UNREAD',
+        ]);
+
+        const resolveLabelId = (value: string) => {
+          const v = value.trim();
+          if (!v) return '';
+          if (systemLabelIds.has(v)) return v;
+          if (/^Label_/.test(v)) return v;
+          const resolved = nameToId.get(v.toLowerCase());
+          if (!resolved) {
+            console.warn(
+              `[Gmail Sync] Label "${v}" not found in Gmail. Using as-is.`,
+            );
+          }
+          return resolved ?? v;
+        };
+
+        const addLabelId = gmailLabel ? resolveLabelId(gmailLabel) : '';
+
+        // Get all column labels for cleanup
+        const columns = await this.getKanbanColumns(userId);
+        const allWorkflowLabels = columns
+          .map((c) => (c.gmailLabel ? resolveLabelId(c.gmailLabel) : ''))
+          .filter((id) => id);
+
+        // Archive column support: empty gmailLabel means remove INBOX
+        const isArchiveColumn = gmailLabel === '';
+
+        // Remove other workflow labels, and INBOX if archiving
+        const removeLabelIds = allWorkflowLabels.filter(
+          (id) => id !== addLabelId && (isArchiveColumn || id !== 'INBOX'),
+        );
+
+        // If archiving, also remove INBOX
+        if (isArchiveColumn && !removeLabelIds.includes('INBOX')) {
+          removeLabelIds.push('INBOX');
+        }
+
+        // Apply label mapping in a single modify call
         await gmail.users.messages.modify({
           userId: 'me',
           id: messageId,
           requestBody: {
-            addLabelIds: [gmailLabel],
+            addLabelIds: addLabelId ? [addLabelId] : undefined,
+            removeLabelIds: removeLabelIds.length ? removeLabelIds : undefined,
           },
         });
 
-        console.log(
-          `[Gmail Sync] Added label ${gmailLabel} to message ${messageId}`,
-        );
+        const action = isArchiveColumn
+          ? 'archived (removed INBOX)'
+          : addLabelId
+            ? `applied label (${gmailLabel} -> ${addLabelId})`
+            : 'removed workflow labels';
+        console.log(`[Gmail Sync] ${action} for message ${messageId}`);
       } catch (error) {
-        console.error(`[Gmail Sync] Failed to add label:`, error);
+        console.error(`[Gmail Sync] Failed to sync labels:`, error);
         // Don't fail the whole operation if Gmail sync fails
       }
     }
@@ -657,6 +959,25 @@ export class KanbanService {
     userId: string,
     columns: KanbanColumnConfig[],
   ): Promise<KanbanColumnConfig[]> {
-    return this.usersService.updateKanbanColumns(userId, columns);
+    const saved = await this.usersService.updateKanbanColumns(userId, columns);
+
+    // If a column was deleted, emails in that status would vanish from the board.
+    // Migrate any non-snoozed emails whose status is no longer present into the first column.
+    const allowedStatusIds = new Set(saved.map((c) => c.id));
+    const fallbackStatus = saved[0]?.id ?? EmailStatus.INBOX;
+    const uid = new Types.ObjectId(userId);
+
+    await this.emailItemModel.updateMany(
+      {
+        userId: uid,
+        status: {
+          $nin: Array.from(allowedStatusIds),
+          $ne: EmailStatus.SNOOZED,
+        },
+      } as any,
+      { $set: { status: fallbackStatus } },
+    );
+
+    return saved;
   }
 }

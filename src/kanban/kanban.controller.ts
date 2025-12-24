@@ -13,7 +13,6 @@ import {
 import type { Request } from 'express';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { KanbanService } from './kanban.service';
-import { EmailStatus } from './schemas/email-item.chema';
 
 @Controller('api/kanban')
 @UseGuards(JwtAuthGuard)
@@ -42,6 +41,23 @@ export class KanbanController {
       pageToken,
       pageSize,
     );
+    return { status: 'success', ...result };
+  }
+
+  @Get('gmail-labels')
+  async getGmailLabels(@Req() req: Request) {
+    const userId = this.getUserId(req);
+    const labels = await this.kanban.getAvailableGmailLabels(userId);
+    return { status: 'success', labels };
+  }
+
+  @Post('validate-label')
+  async validateLabel(
+    @Req() req: Request,
+    @Body() body: { labelName: string },
+  ) {
+    const userId = this.getUserId(req);
+    const result = await this.kanban.validateGmailLabel(userId, body.labelName);
     return { status: 'success', ...result };
   }
 
@@ -100,7 +116,7 @@ export class KanbanController {
   async updateStatus(
     @Req() req: Request,
     @Param('messageId') messageId: string,
-    @Body() body: { status: EmailStatus; gmailLabel?: string },
+    @Body() body: { status: string; gmailLabel?: string },
   ) {
     const userId = this.getUserId(req);
     const updated = await this.kanban.updateStatus(

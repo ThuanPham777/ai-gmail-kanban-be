@@ -146,16 +146,44 @@ export class UsersService {
       settings = new this.userSettingsModel({ userId });
       await settings.save();
     }
-    return settings.kanbanColumns;
+    return [...settings.kanbanColumns].sort(
+      (a, b) => (a.order ?? 0) - (b.order ?? 0),
+    );
   }
 
   async updateKanbanColumns(
     userId: string,
     columns: KanbanColumnConfig[],
   ): Promise<KanbanColumnConfig[]> {
+    if (!Array.isArray(columns) || columns.length === 0) {
+      throw new ConflictException('At least one column is required.');
+    }
+
+    // Basic validation + normalization
+    const idSet = new Set<string>();
+    const normalized = columns.map((c, idx) => {
+      const id = String(c.id ?? '').trim();
+      const name = String(c.name ?? '').trim();
+      const gmailLabel = c.gmailLabel ? String(c.gmailLabel).trim() : undefined;
+      const order = Number.isFinite(Number(c.order)) ? Number(c.order) : idx;
+      if (!id) throw new ConflictException('Column id is required.');
+      if (!name) throw new ConflictException('Column name is required.');
+      if (idSet.has(id)) {
+        throw new ConflictException(
+          `Duplicate column id "${id}" is not allowed.`,
+        );
+      }
+      idSet.add(id);
+      return { id, name, gmailLabel: gmailLabel || undefined, order };
+    });
+
+    // Normalize ordering to 0..n-1 by provided order
+    normalized.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    normalized.forEach((c, i) => (c.order = i));
+
     // Validate for duplicate column names (case-insensitive)
     const nameMap = new Map<string, string>();
-    for (const col of columns) {
+    for (const col of normalized) {
       const lowerName = col.name.toLowerCase().trim();
       if (nameMap.has(lowerName)) {
         throw new ConflictException(
@@ -165,13 +193,29 @@ export class UsersService {
       nameMap.set(lowerName, col.name);
     }
 
+    // Validate for duplicate Gmail labels (case-insensitive, skip empty labels)
+    const labelMap = new Map<string, string>();
+    for (const col of normalized) {
+      if (col.gmailLabel) {
+        const lowerLabel = col.gmailLabel.toLowerCase().trim();
+        if (labelMap.has(lowerLabel)) {
+          throw new ConflictException(
+            `Gmail label "${col.gmailLabel}" is already used by another column. Each Gmail label can only be assigned to one column.`,
+          );
+        }
+        labelMap.set(lowerLabel, col.gmailLabel);
+      }
+    }
+
     const settings = await this.userSettingsModel
       .findOneAndUpdate(
         { userId },
-        { kanbanColumns: columns },
+        { kanbanColumns: normalized },
         { new: true, upsert: true },
       )
       .exec();
-    return settings.kanbanColumns;
+    return [...settings.kanbanColumns].sort(
+      (a, b) => (a.order ?? 0) - (b.order ?? 0),
+    );
   }
 }
