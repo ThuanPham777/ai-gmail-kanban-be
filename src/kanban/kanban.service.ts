@@ -578,6 +578,7 @@ export class KanbanService {
   ) {
     const uid = new Types.ObjectId(userId);
     const gmail = await this.getGmailClient(userId);
+    const now = new Date();
 
     // Get user's column configuration
     const columns = await this.getKanbanColumns(userId);
@@ -683,14 +684,15 @@ export class KanbanService {
           const response = await gmail.users.messages.list({
             userId: 'me',
             labelIds: [gmailLabelId],
-            maxResults: (skipMap[col.id] || 0) + pageSize,
+            // Fetch a bit extra to compensate for filtered-out snoozed items
+            maxResults: Math.min(500, (skipMap[col.id] || 0) + pageSize * 3),
           });
 
           const messages = response.data.messages || [];
 
           // Apply pagination (skip already fetched items)
           const skip = skipMap[col.id] || 0;
-          const paginatedMessages = messages.slice(skip, skip + pageSize);
+          const paginatedMessages = messages.slice(skip, skip + pageSize * 3);
 
           // Fetch email details from MongoDB (or sync if missing)
           const items = await Promise.all(
@@ -707,8 +709,43 @@ export class KanbanService {
                   .lean();
               }
 
+              if (!item) return null;
+
+              // Hide active snoozed emails from the board.
+              // If a snooze has expired but cron hasn't run yet, wake it on-read.
+              if (item.status === EmailStatus.SNOOZED) {
+                const snoozeUntil = (item as any).snoozeUntil
+                  ? new Date((item as any).snoozeUntil)
+                  : null;
+
+                if (snoozeUntil && Number.isFinite(snoozeUntil.getTime())) {
+                  if (snoozeUntil.getTime() > now.getTime()) {
+                    return null;
+                  }
+
+                  const restoreTo =
+                    (item as any).originalStatus ?? EmailStatus.INBOX;
+                  await this.emailItemModel.updateOne(
+                    { userId: uid, messageId: msg.id },
+                    {
+                      $set: { status: restoreTo },
+                      $unset: { snoozeUntil: 1, originalStatus: 1 },
+                    },
+                  );
+                  item = {
+                    ...(item as any),
+                    status: restoreTo,
+                    snoozeUntil: undefined,
+                    originalStatus: undefined,
+                  };
+                } else {
+                  // No valid snoozeUntil -> keep it hidden and let cron clean it up later.
+                  return null;
+                }
+              }
+
               // Ensure status matches column ID
-              if (item && item.status !== col.id) {
+              if (item.status !== col.id) {
                 await this.emailItemModel.updateOne(
                   { userId: uid, messageId: msg.id },
                   { $set: { status: col.id } },
@@ -716,18 +753,16 @@ export class KanbanService {
                 item.status = col.id;
               }
 
-              return item
-                ? {
-                    ...item,
-                    hasAttachments: item.hasAttachments ?? false,
-                  }
-                : null;
+              return {
+                ...item,
+                hasAttachments: item.hasAttachments ?? false,
+              };
             }),
           );
 
           return {
             status: col.id,
-            items: items.filter((i) => i !== null),
+            items: items.filter((i) => i !== null).slice(0, pageSize),
             total: messages.length, // Total count from Gmail
           };
         } catch (error) {

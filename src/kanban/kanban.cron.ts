@@ -8,8 +8,8 @@ export class KanbanCron {
 
   constructor(private readonly kanban: KanbanService) {}
 
-  // chạy mỗi 5 phút để wake snoozed emails (reduced frequency to save memory)
-  @Cron('*/5 * * * *')
+  // chạy mỗi 1 phút để wake snoozed emails (reduced frequency to save memory)
+  @Cron('*/1 * * * *')
   async wake() {
     try {
       const result = await this.kanban.wakeExpiredSnoozed();
