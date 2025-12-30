@@ -7,7 +7,7 @@ NestJS backend service that powers an intelligent email management system with J
 ### Authentication & Security
 
 - Email/password registration & login with bcrypt hashed passwords
-- Google One Tap / Sign-In OAuth 2.0 integration
+- Google OAuth 2.0 code flow integration (Gmail scopes + offline refresh token)
 - JWT access/refresh token rotation with secure storage in MongoDB
 - Passport JWT guard protecting all email and Kanban endpoints
 
@@ -57,7 +57,7 @@ Create `.env` file alongside `package.json`:
 
 ```env
 MONGODB_URI=mongodb://localhost:27017/react-authentication
-PORT=4000
+PORT=3000
 CORS_ORIGIN=http://localhost:5173
 JWT_ACCESS_SECRET=replace-with-strong-secret
 JWT_ACCESS_EXPIRES=15m
@@ -70,6 +70,9 @@ GOOGLE_CLIENT_SECRET=GOCSPX-...
 
 OPENAI_API_KEY=sk-proj-....
 OPENAI_MODEL_SUMMARY=
+
+QDRANT_URL=
+QDRANT_API_KEY=
 ```
 
 ### 3. Run Development Server
@@ -78,7 +81,7 @@ OPENAI_MODEL_SUMMARY=
 npm run start:dev
 ```
 
-The backend will start on `http://localhost:4000`
+The backend will start on `http://localhost:3000`
 
 > **Heads-up:** `GOOGLE_CLIENT_ID` must match the client ID configured in Google Identity Services (used for app login).
 
@@ -95,32 +98,40 @@ The backend will start on `http://localhost:4000`
 
 ### Authentication Endpoints
 
-| Method | Endpoint             | Description                            |
-| ------ | -------------------- | -------------------------------------- |
-| `POST` | `/api/auth/register` | Email/password signup                  |
-| `POST` | `/api/auth/login`    | Issue access + refresh token           |
-| `POST` | `/api/auth/google`   | Exchange Google credential for tokens  |
-| `POST` | `/api/auth/refresh`  | Rotate refresh token, issue new access |
-| `POST` | `/api/auth/logout`   | Revoke stored refresh token            |
+| Method | Endpoint                      | Description                                                         |
+| ------ | ----------------------------- | ------------------------------------------------------------------- |
+| `POST` | `/api/auth/register`          | Email/password signup                                               |
+| `POST` | `/api/auth/login`             | Issue access + refresh token                                        |
+| `POST` | `/api/auth/google/full-login` | Google OAuth code flow login (Gmail scopes + offline refresh token) |
+| `POST` | `/api/auth/refresh`           | Rotate refresh token, issue new access                              |
+| `POST` | `/api/auth/logout`            | Revoke stored refresh token                                         |
+
+### Health
+
+| Method | Endpoint  | Description  |
+| ------ | --------- | ------------ |
+| `GET`  | `/health` | Health check |
 
 ### Mailbox & Email Endpoints
 
-| Method | Endpoint                    | Description                                |
-| ------ | --------------------------- | ------------------------------------------ |
-| `GET`  | `/api/mailboxes`            | List folders + unread counts (JWT)         |
-| `GET`  | `/api/mailboxes/:id/emails` | Paginated list for a folder (JWT)          |
-| `GET`  | `/api/emails/:id`           | Email detail, metadata, attachments (JWT)  |
-| `POST` | `/api/emails/send`          | Send email (JWT)                           |
-| `POST` | `/api/emails/:id/reply`     | Reply to an email (JWT)                    |
-| `POST` | `/api/emails/:id/forward`   | Forward an email (JWT)                     |
-| `POST` | `/api/emails/:id/modify`    | Modify email (mark read/unread, star, etc) |
-| `GET`  | `/api/attachments/:id`      | Download attachment (JWT)                  |
+| Method | Endpoint                    | Description                                                                             |
+| ------ | --------------------------- | --------------------------------------------------------------------------------------- |
+| `GET`  | `/api/mailboxes`            | List folders + unread counts (JWT)                                                      |
+| `GET`  | `/api/mailboxes/:id/emails` | Paginated list for a folder (JWT). Supports `pageToken` + `limit`, with `page` fallback |
+| `GET`  | `/api/emails/:id`           | Email detail, metadata, attachments (JWT)                                               |
+| `POST` | `/api/emails/send`          | Send email (JWT)                                                                        |
+| `POST` | `/api/emails/:id/reply`     | Reply to an email (JWT)                                                                 |
+| `POST` | `/api/emails/:id/forward`   | Forward an email (JWT)                                                                  |
+| `POST` | `/api/emails/:id/modify`    | Modify email (mark read/unread, star, etc)                                              |
+| `GET`  | `/api/attachments/:id`      | Download attachment (JWT)                                                               |
 
 ### Kanban Board Endpoints
 
 | Method  | Endpoint                                          | Description                        |
 | ------- | ------------------------------------------------- | ---------------------------------- |
 | `GET`   | `/api/kanban/board`                               | Get kanban board data (JWT)        |
+| `GET`   | `/api/kanban/gmail-labels`                        | List available Gmail labels (JWT)  |
+| `POST`  | `/api/kanban/validate-label`                      | Validate a Gmail label name (JWT)  |
 | `GET`   | `/api/kanban/search`                              | Fuzzy search emails (JWT)          |
 | `POST`  | `/api/kanban/search/semantic`                     | Semantic vector search (JWT)       |
 | `GET`   | `/api/kanban/search/suggestions`                  | Get search suggestions (JWT)       |
@@ -144,4 +155,4 @@ All protected routes expect `Authorization: Bearer <accessToken>`.
 
 - Provide a managed MongoDB connection string through `MONGODB_URI`.
 - Ensure the deployed frontend origin is present in Google’s OAuth config and in `CORS_ORIGIN`.
-- Never commit secrets—use environment variables provided by your host (Render, Vercel, etc.).\*\*\*
+- Never commit secrets—use environment variables provided by your host (Render, Vercel, etc.).
