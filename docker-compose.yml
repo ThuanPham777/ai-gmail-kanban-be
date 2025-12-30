@@ -1,8 +1,36 @@
-version: '3.8'
+# NOTE:
+# Backend and frontend are separate git repos.
+# Keep this compose file focused on backend + infra only.
+# If you want to run backend+frontend together, use a separate deployment/workspace compose
+# (e.g. a third repo/folder that has both repos checked out side-by-side).
 
 services:
+  # MongoDB Database
+  mongodb:
+    image: mongo:7
+    container_name: email-kanban-mongodb
+    restart: unless-stopped
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-admin123}
+      MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE:-email_kanban}
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - email-kanban-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Qdrant Vector Database
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: email-kanban-qdrant
+    restart: unless-stopped
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -10,6 +38,53 @@ services:
       - qdrant_storage:/qdrant/storage
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334
+    networks:
+      - email-kanban-network
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "(command -v curl >/dev/null 2>&1 && curl -fsS http://localhost:6333/health >/dev/null) || (command -v wget >/dev/null 2>&1 && wget -qO- http://localhost:6333/health >/dev/null)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: email-kanban-backend
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - MONGODB_URI=${MONGODB_URI:-mongodb://admin:admin123@mongodb:27017/email_kanban?authSource=admin}
+      - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
+      - CORS_ORIGIN=${CORS_ORIGIN:-http://localhost}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - email-kanban-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  email-kanban-network:
+    driver: bridge
 
 volumes:
+  mongodb_data:
   qdrant_storage:
+

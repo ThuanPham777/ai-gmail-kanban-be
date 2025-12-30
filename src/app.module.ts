@@ -9,6 +9,7 @@ import { MailModule } from './mail/mail.module';
 import { KanbanModule } from './kanban/kanban.module';
 import { GlobalExceptionFilter } from './common/filters/http-exception.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
+import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { TransformInterceptor } from './common/interceptors/transform.intercepto
     AuthModule,
     MailModule,
     KanbanModule,
+    HealthModule,
   ],
   providers: [
     {
