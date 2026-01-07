@@ -1,6 +1,5 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { Document } from 'mongoose';
-import * as bcrypt from 'bcrypt';
 
 export type UserDocument = User & Document;
 
@@ -12,13 +11,6 @@ export class User {
   @Prop({ required: true, unique: true, lowercase: true, trim: true })
   email: string;
 
-  @Prop({
-    required: function (this: User) {
-      return this.provider === 'password';
-    },
-  })
-  password?: string;
-
   @Prop({ required: false, trim: true })
   name?: string;
 
@@ -27,16 +19,16 @@ export class User {
 
   @Prop({
     required: true,
-    enum: ['password', 'google'],
-    default: 'password',
+    enum: ['google'],
+    default: 'google',
   })
-  provider: 'password' | 'google';
+  provider: 'google';
 
   // Google identity (để identify user)
-  @Prop({ required: false, unique: true, sparse: true })
-  googleId?: string;
+  @Prop({ required: true, unique: true })
+  googleId: string;
 
-  // Refresh token của app (JWT refresh)
+  // Refresh token của app (JWT refresh) - stored hashed
   @Prop({ required: false })
   refreshToken?: string;
 
@@ -62,24 +54,15 @@ export class User {
 
 export const UserSchema = SchemaFactory.createForClass(User);
 
-// Hide password when JSON stringifying
+// Hide sensitive data when JSON stringifying
 UserSchema.set('toJSON', {
   transform: (_doc: any, ret: any) => {
-    delete ret.password;
     // never expose app refresh token to client
     delete ret.refreshToken;
     if (ret.gmail?.refreshToken) {
-      // không nên trả token ra client
+      // không nên trả Gmail refresh token ra client
       delete ret.gmail.refreshToken;
     }
     return ret;
   },
-});
-
-// Hash on create or when password changed
-UserSchema.pre<UserDocument>('save', async function (next) {
-  if (!this.isModified('password') || !this.password) return next();
-  const salt = await bcrypt.genSalt(10);
-  this.password = await bcrypt.hash(this.password, salt);
-  next();
 });

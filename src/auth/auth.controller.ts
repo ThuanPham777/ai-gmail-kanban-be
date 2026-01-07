@@ -8,15 +8,11 @@ import {
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { UsersService } from '../users/users.service';
-import { RegisterDto } from '../users/dtos/register.dto';
-import { LoginDto } from '../users/dtos/login.dto';
 import { MongoExceptionFilter } from '../common/filters/mongo-exception.filter';
 import { GoogleAuthService } from './google-auth.service';
 import { JwtPayload } from './strategies/jwt.strategy';
 import { RefreshTokenDto, LogoutDto, GoogleLoginDto } from './dtos/request';
 import {
-  RegisterResponseDto,
-  LoginResponseDto,
   RefreshTokenResponseDto,
   GoogleLoginResponseDto,
 } from './dtos/response';
@@ -30,38 +26,6 @@ export class AuthController {
     private readonly usersService: UsersService,
     private readonly googleAuthService: GoogleAuthService,
   ) {}
-
-  @Post('register')
-  async register(
-    @Body() dto: RegisterDto,
-  ): Promise<ApiResponseDto<RegisterResponseDto>> {
-    const created = await this.usersService.createLocalUser(
-      dto.email,
-      dto.password,
-    );
-    const response = RegisterResponseDto.create(created);
-    return ApiResponseDto.success(response, 'User registered successfully');
-  }
-
-  @Post('login')
-  async login(
-    @Body() dto: LoginDto,
-  ): Promise<ApiResponseDto<LoginResponseDto>> {
-    const user = await this.usersService.verifyCredentials(
-      dto.email,
-      dto.password,
-    );
-    const { accessToken, refreshToken } = this.authService.issueTokens({
-      sub: (user as any)._id,
-      email: user.email,
-    });
-    await this.usersService.setRefreshToken(
-      (user as any)._id.toString(),
-      refreshToken,
-    );
-    const response = LoginResponseDto.create(accessToken, refreshToken, user);
-    return ApiResponseDto.success(response, 'Login successful');
-  }
 
   @Post('refresh')
   async refresh(
@@ -114,14 +78,21 @@ export class AuthController {
     return ApiResponseDto.success(null, 'Logged out');
   }
 
-  @Post('google/full-login')
-  async googleFullLogin(
+  /**
+   * Google OAuth 2.0 Login/Register
+   * - Email doesn't exist → register new user
+   * - Email exists → login existing user
+   * Uses Authorization Code flow with offline access for Gmail refresh token
+   */
+  @Post('google/login')
+  async googleLogin(
     @Body() dto: GoogleLoginDto,
   ): Promise<ApiResponseDto<GoogleLoginResponseDto>> {
     const { identity, tokens } =
       await this.googleAuthService.exchangeCodeForTokens(dto.code);
 
-    const user = await this.usersService.findOrCreateGoogleUser({
+    // findOrCreateGoogleUser handles both register (new user) and login (existing user)
+    const { user, isNewUser } = await this.usersService.findOrCreateGoogleUser({
       email: identity.email!,
       googleId: identity.sub,
       name: identity.name,
@@ -134,15 +105,19 @@ export class AuthController {
       );
     }
 
+    // Store Gmail OAuth refresh token for Gmail API access
     await this.usersService.updateGmailTokens((user as any)._id.toString(), {
       refreshToken: tokens.refresh_token!,
       scope: tokens.scope,
     });
 
+    // Issue app JWT tokens (access + refresh)
     const { accessToken, refreshToken } = this.authService.issueTokens({
       sub: (user as any)._id,
       email: user.email,
     });
+
+    // Store hashed refresh token server-side for validation
     await this.usersService.setRefreshToken(
       (user as any)._id.toString(),
       refreshToken,
@@ -152,7 +127,9 @@ export class AuthController {
       accessToken,
       refreshToken,
       user,
+      isNewUser,
     );
-    return ApiResponseDto.success(response, 'Login successful');
+    const message = isNewUser ? 'Registration successful' : 'Login successful';
+    return ApiResponseDto.success(response, message);
   }
 }
