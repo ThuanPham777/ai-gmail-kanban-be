@@ -4,12 +4,17 @@ NestJS backend service that powers an intelligent email management system with J
 
 ## Features
 
-### Authentication & Security
+### Authentication & Security (Google OAuth 2.0 Only)
 
-- Email/password registration & login with bcrypt hashed passwords
-- Google OAuth 2.0 code flow integration (Gmail scopes + offline refresh token)
-- JWT access/refresh token rotation with secure storage in MongoDB
-- Passport JWT guard protecting all email and Kanban endpoints
+- **Google OAuth 2.0 code flow** - Single sign-in method for both login and registration
+- **Gmail API scopes** - Automatic permission request for email read/modify/send
+- **Offline refresh token** - Secure server-side storage for Gmail API access
+- **JWT access/refresh token rotation** - Secure session management with token rotation
+- **Hashed refresh tokens** - Server-side refresh tokens stored with bcrypt hashing
+- **Automatic token refresh** - Transparent token renewal when access token expires
+- **Concurrency handling** - Single refresh request when multiple 401s occur
+- **Cross-tab sync** - BroadcastChannel for instant auth state synchronization
+- **Secure logout** - Complete cleanup of all tokens (server + client side)
 
 ### Email Management
 
@@ -98,13 +103,13 @@ The backend will start on `http://localhost:3000`
 
 ### Authentication Endpoints
 
-| Method | Endpoint                      | Description                                                         |
-| ------ | ----------------------------- | ------------------------------------------------------------------- |
-| `POST` | `/api/auth/register`          | Email/password signup                                               |
-| `POST` | `/api/auth/login`             | Issue access + refresh token                                        |
-| `POST` | `/api/auth/google/full-login` | Google OAuth code flow login (Gmail scopes + offline refresh token) |
-| `POST` | `/api/auth/refresh`           | Rotate refresh token, issue new access                              |
-| `POST` | `/api/auth/logout`            | Revoke stored refresh token                                         |
+| Method | Endpoint                 | Description                                                                                                      |
+| ------ | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/auth/google/login` | Google OAuth code flow (Gmail scopes + offline refresh token). Handles both login (existing) and register (new). |
+| `POST` | `/api/auth/refresh`      | Rotate refresh token, issue new access token                                                                     |
+| `POST` | `/api/auth/logout`       | Revoke stored refresh token, clear server-side session                                                           |
+
+**Note:** This app uses Google OAuth 2.0 exclusively. Email/password authentication has been removed.
 
 ### Health
 

@@ -3,8 +3,8 @@ export class UserResponseDto {
   email: string;
   name?: string;
   avatarUrl?: string;
-  provider: 'password' | 'google';
-  googleId?: string;
+  provider: 'google';
+  googleId: string;
   gmailConnected?: boolean;
   createdAt: Date;
 

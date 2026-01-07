@@ -20,24 +20,6 @@ export class UsersService {
     private userSettingsModel: Model<UserSettings>,
   ) {}
 
-  async createLocalUser(
-    email: string,
-    rawPassword: string,
-    name?: string,
-  ): Promise<User> {
-    const existing = await this.findByEmail(email);
-    if (existing) {
-      throw new ConflictException('Email is already registered');
-    }
-    const user = new this.userModel({
-      email,
-      password: rawPassword,
-      name,
-      provider: 'password',
-    });
-    return user.save();
-  }
-
   async findByEmail(email: string): Promise<User | null> {
     return this.userModel.findOne({ email }).exec();
   }
@@ -46,27 +28,32 @@ export class UsersService {
     return this.userModel.findById(userId).exec();
   }
 
-  async verifyCredentials(email: string, password: string): Promise<User> {
-    const user = await this.findByEmail(email);
-    if (!user || user.provider !== 'password' || !user.password) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
-    const ok = await bcrypt.compare(password, user.password);
-    if (!ok) throw new UnauthorizedException('Invalid credentials');
-    return user;
+  async findByGoogleId(googleId: string): Promise<User | null> {
+    return this.userModel.findOne({ googleId }).exec();
   }
 
+  /**
+   * Find or create a user by Google OAuth
+   * - If user with googleId exists → login (return existing)
+   * - If user with email exists → link Google account and login
+   * - If no user exists → register new user
+   * @returns { user, isNewUser } - isNewUser indicates if this was a registration
+   */
   async findOrCreateGoogleUser(params: {
     email: string;
     googleId: string;
     name?: string;
     avatarUrl?: string;
-  }): Promise<User> {
+  }): Promise<{ user: User; isNewUser: boolean }> {
+    // Check if user already exists with this Google ID
     const existingByGoogleId = await this.userModel
       .findOne({ googleId: params.googleId })
       .exec();
-    if (existingByGoogleId) return existingByGoogleId;
+    if (existingByGoogleId) {
+      return { user: existingByGoogleId, isNewUser: false };
+    }
 
+    // Check if user exists with this email (may have been created differently)
     const existingByEmail = await this.userModel
       .findOne({ email: params.email })
       .exec();
@@ -76,9 +63,11 @@ export class UsersService {
       existingByEmail.provider = 'google';
       existingByEmail.name = params.name ?? existingByEmail.name;
       existingByEmail.avatarUrl = params.avatarUrl ?? existingByEmail.avatarUrl;
-      return existingByEmail.save();
+      const savedUser = await existingByEmail.save();
+      return { user: savedUser, isNewUser: false };
     }
 
+    // Create new user (registration)
     const user = new this.userModel({
       email: params.email,
       provider: 'google',
@@ -86,7 +75,8 @@ export class UsersService {
       name: params.name,
       avatarUrl: params.avatarUrl,
     });
-    return user.save();
+    const savedUser = await user.save();
+    return { user: savedUser, isNewUser: true };
   }
 
   async setRefreshToken(userId: string, refreshToken: string): Promise<void> {
