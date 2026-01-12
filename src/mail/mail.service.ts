@@ -320,18 +320,90 @@ export class MailService {
 
     const labels = res.data.labels ?? [];
 
-    // Lấy unread count (có thể tốn call nhưng ok cho demo)
+    // Gmail API already filters visible labels
+    // We just exclude some technical/internal labels that users don't need to see
+    const excludeLabels = new Set([
+      'DRAFT', // Draft folder usually not useful in email client
+    ]);
+
+    const visibleLabels = labels.filter((lb) => {
+      if (!lb.id) return false;
+      if (excludeLabels.has(lb.id)) return false;
+      return true;
+    });
+
+    // Get unread count for each label
     const items: Array<{ id: string; name: string; unread?: number }> = [];
-    for (const lb of labels) {
+    for (const lb of visibleLabels) {
       if (!lb.id) continue;
+
+      // Some labels might fail to fetch details (e.g., hidden labels)
       const detail = await gmail.users.labels
         .get({ userId: 'me', id: lb.id })
-        .catch(() => null);
+        .catch((err) => {
+          console.warn(
+            `Failed to get label details for ${lb.id}:`,
+            err.message,
+          );
+          return null;
+        });
+
       items.push({
         id: lb.id,
         name: lb.name ?? lb.id,
         unread: detail?.data?.messagesUnread ?? 0,
       });
+    }
+
+    // Sort: system labels first, then user labels alphabetically
+    items.sort((a, b) => {
+      const systemLabels = [
+        'INBOX',
+        'STARRED',
+        'IMPORTANT',
+        'SENT',
+        'TRASH',
+        'SPAM',
+        'UNREAD',
+      ];
+
+      const aIsSystem = systemLabels.includes(a.id);
+      const bIsSystem = systemLabels.includes(b.id);
+
+      if (aIsSystem && !bIsSystem) return -1;
+      if (!aIsSystem && bIsSystem) return 1;
+
+      // Both system or both user: sort alphabetically
+      return a.name.localeCompare(b.name);
+    });
+
+    // Add SNOOZED as virtual mailbox (Gmail doesn't have a SNOOZED label,
+    // must use q: 'is:snoozed' to fetch snoozed emails)
+    // Check if there are any snoozed emails
+    try {
+      const snoozedCheck = await gmail.users.messages.list({
+        userId: 'me',
+        q: 'is:snoozed',
+        maxResults: 1,
+      });
+
+      // Only add SNOOZED mailbox if user has snoozed emails
+      if (snoozedCheck.data.messages?.length) {
+        // Get count of snoozed emails
+        const snoozedList = await gmail.users.messages.list({
+          userId: 'me',
+          q: 'is:snoozed',
+          maxResults: 100, // Cap at 100 for performance
+        });
+
+        items.unshift({
+          id: 'SNOOZED',
+          name: 'SNOOZED',
+          unread: snoozedList.data.messages?.length ?? 0,
+        });
+      }
+    } catch (err) {
+      console.warn('Failed to check snoozed emails:', err);
     }
 
     return items;
@@ -347,9 +419,12 @@ export class MailService {
     const gmail = await this.getGmailClient(userId);
     const safeSize = Math.min(Math.max(pageSize, 1), 50);
 
+    // SNOOZED is a virtual mailbox - use query instead of labelId
+    const isSnoozed = mailboxId === 'SNOOZED';
+
     const list = await gmail.users.messages.list({
       userId: 'me',
-      labelIds: [mailboxId],
+      ...(isSnoozed ? { q: 'is:snoozed' } : { labelIds: [mailboxId] }),
       maxResults: safeSize,
       pageToken: pageToken || undefined,
     });
@@ -428,13 +503,19 @@ export class MailService {
     const safePage = Math.min(Math.max(page, 1), 5); // cap to 5 pages to avoid deep traversal
     const safeSize = Math.min(Math.max(pageSize, 1), 50);
 
+    // SNOOZED is a virtual mailbox - use query instead of labelId
+    const isSnoozed = mailboxId === 'SNOOZED';
+    const listParams = isSnoozed
+      ? { q: 'is:snoozed' }
+      : { labelIds: [mailboxId] };
+
     // traverse pageToken sequentially but cap at safePage to avoid large memory
     let pageToken: string | undefined = undefined;
     for (let i = 1; i < safePage; i++) {
       const step = await gmail.users.messages
         .list({
           userId: 'me',
-          labelIds: [mailboxId],
+          ...listParams,
           maxResults: safeSize,
           pageToken,
         })
@@ -445,7 +526,7 @@ export class MailService {
 
     const list = await gmail.users.messages.list({
       userId: 'me',
-      labelIds: [mailboxId],
+      ...listParams,
       maxResults: safeSize,
       pageToken,
     });

@@ -95,6 +95,14 @@ export class KanbanService {
         }
       }
 
+      // Add SNOOZED as virtual label (not a real Gmail label, uses q: 'is:snoozed')
+      // This allows users to configure a column that shows snoozed emails
+      processedLabels.push({
+        id: 'SNOOZED',
+        name: 'SNOOZED',
+        type: 'virtual', // Mark as virtual to distinguish from real labels
+      });
+
       return processedLabels.sort((a, b) => {
         // System labels first, then alphabetically
         if (a.type === 'system' && b.type !== 'system') return -1;
@@ -134,11 +142,22 @@ export class KanbanService {
         'UNREAD',
       ]);
 
+      // Virtual labels that use query instead of labelId
+      const virtualLabels = new Set(['SNOOZED']);
+
       const trimmed = labelName.trim();
 
       // Check if it's a system label
       if (systemLabelIds.has(trimmed)) {
         return { valid: true, message: `System label: ${trimmed}` };
+      }
+
+      // Check if it's a virtual label (e.g., SNOOZED)
+      if (virtualLabels.has(trimmed)) {
+        return {
+          valid: true,
+          message: `Virtual label: ${trimmed} (uses Gmail search query)`,
+        };
       }
 
       // Check if label exists (case-insensitive)
@@ -660,11 +679,15 @@ export class KanbanService {
       'UNREAD',
     ]);
 
-    // Resolve label name -> label id
+    // Virtual labels that use query instead of labelId
+    const virtualLabels = new Set(['SNOOZED']);
+
+    // Resolve label name -> label id (or 'SNOOZED' for virtual labels)
     const resolveLabelId = (value: string) => {
       const v = value.trim();
       if (!v) return '';
       if (systemLabelIds.has(v)) return v;
+      if (virtualLabels.has(v)) return v; // Return virtual label as-is
       if (/^Label_/.test(v)) return v;
       const resolved = nameToId.get(v.toLowerCase());
       if (!resolved) {
@@ -733,11 +756,14 @@ export class KanbanService {
         }
 
         try {
+          // SNOOZED is a virtual label - use query instead of labelId
+          const isSnoozed = gmailLabelId === 'SNOOZED';
+
           // Fetch message IDs from Gmail for this label
           // Gmail API returns messages sorted by internalDate descending (newest first)
           const response = await gmail.users.messages.list({
             userId: 'me',
-            labelIds: [gmailLabelId],
+            ...(isSnoozed ? { q: 'is:snoozed' } : { labelIds: [gmailLabelId] }),
             // Limit to avoid excessive API calls and token consumption
             maxResults: Math.min(100, (skipMap[col.id] || 0) + pageSize * 2),
           });
@@ -756,8 +782,14 @@ export class KanbanService {
                 .lean();
 
               // If not in MongoDB, sync it first
+              // For SNOOZED, sync to INBOX first (snoozed emails are still in INBOX)
               if (!item) {
-                await this.syncLabelToItems(userId, gmailLabelId, 1, msg.id);
+                await this.syncLabelToItems(
+                  userId,
+                  isSnoozed ? 'INBOX' : gmailLabelId,
+                  1,
+                  msg.id,
+                );
                 item = await this.emailItemModel
                   .findOne({ userId: uid, messageId: msg.id })
                   .lean();
