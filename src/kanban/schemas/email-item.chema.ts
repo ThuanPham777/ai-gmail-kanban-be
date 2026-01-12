@@ -56,6 +56,11 @@ export class EmailItem {
   @Prop() summary?: string;
   @Prop() lastSummarizedAt?: Date;
 
+  // Email received/sent date from Gmail (internalDate)
+  // Used for sorting emails by actual received time, not DB insert time
+  @Prop({ type: Date, index: true })
+  receivedAt?: Date;
+
   // Whether the message has attachments (set during sync or when fetching details)
   @Prop() hasAttachments?: boolean;
 

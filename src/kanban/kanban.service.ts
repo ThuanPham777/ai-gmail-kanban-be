@@ -588,6 +588,12 @@ export class KanbanService {
         hasAttachments = false;
       }
 
+      // Parse Gmail internalDate (milliseconds since epoch)
+      let receivedAt: Date | undefined;
+      if (detail.data.internalDate) {
+        receivedAt = new Date(parseInt(detail.data.internalDate, 10));
+      }
+
       const result = await this.emailItemModel.updateOne(
         { userId: uid, messageId: m.id },
         {
@@ -605,6 +611,7 @@ export class KanbanService {
             snippet,
             threadId: detail.data.threadId,
             hasAttachments,
+            ...(receivedAt && { receivedAt }), // Only set if available
           },
         },
         { upsert: true },
@@ -707,7 +714,7 @@ export class KanbanService {
           const skip = skipMap[col.id] || 0;
           const items = await this.emailItemModel
             .find({ userId: uid, status: col.id })
-            .sort({ createdAt: -1 })
+            .sort({ receivedAt: -1, createdAt: -1 }) // Sort by email received time, fallback to DB insert time
             .skip(skip)
             .limit(pageSize)
             .lean();
@@ -727,6 +734,7 @@ export class KanbanService {
 
         try {
           // Fetch message IDs from Gmail for this label
+          // Gmail API returns messages sorted by internalDate descending (newest first)
           const response = await gmail.users.messages.list({
             userId: 'me',
             labelIds: [gmailLabelId],
