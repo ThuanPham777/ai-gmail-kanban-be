@@ -534,6 +534,42 @@ export class KanbanService {
   }
 
   /**
+   * Detect real attachments in email payload
+   * Excludes inline images (signatures, embedded images)
+   */
+  private detectAttachments(payload: any): boolean {
+    const walk = (node: any): boolean => {
+      if (!node) return false;
+
+      // Check if this part has a real attachment (not inline)
+      if (node.filename && node.filename.trim()) {
+        const headers = node.headers || [];
+        const disposition = headers.find(
+          (h: any) => h.name?.toLowerCase() === 'content-disposition',
+        );
+        const dispositionValue = disposition?.value?.toLowerCase() || '';
+
+        // It's a real attachment if has attachmentId AND not inline
+        if (node.body?.attachmentId && !dispositionValue.startsWith('inline')) {
+          return true;
+        }
+      }
+
+      // Recurse into parts
+      if (node.parts && Array.isArray(node.parts)) {
+        return node.parts.some((p: any) => walk(p));
+      }
+      return false;
+    };
+
+    try {
+      return walk(payload);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Đồng bộ tối thiểu: lấy list Gmail messages theo label,
    * upsert vào email_items để phục vụ Kanban.
    * Always detects attachments for filtering support.
@@ -589,23 +625,8 @@ export class KanbanService {
         );
       }
 
-      // Detect attachments if requested (walk payload)
-      let hasAttachments = false;
-      try {
-        const walk = (node: any): boolean => {
-          if (!node) return false;
-          if (node.filename) return true;
-          if (node.body && node.body.attachmentId) return true;
-          if (node.parts && Array.isArray(node.parts)) {
-            return node.parts.some((p: any) => walk(p));
-          }
-          return false;
-        };
-
-        hasAttachments = walk(detail.data.payload);
-      } catch (e) {
-        hasAttachments = false;
-      }
+      // Detect attachments - exclude inline images
+      const hasAttachments = this.detectAttachments(detail.data.payload);
 
       // Parse Gmail internalDate (milliseconds since epoch)
       let receivedAt: Date | undefined;
@@ -647,20 +668,238 @@ export class KanbanService {
     return { synced: msgs.length };
   }
 
-  async getBoard(userId: string, pageToken?: string, pageSize: number = 20) {
+  async getBoard(userId: string, pageToken?: string, pageSize: number = 10) {
     const uid = new Types.ObjectId(userId);
-    const gmail = await this.getGmailClient(userId);
-    const now = new Date();
 
     // Get user's column configuration
     const columns = await this.getKanbanColumns(userId);
 
-    // Fetch all Gmail labels for resolution
+    // Decode pageToken to get skip offset and Gmail sync state for each column
+    let skipMap: Record<string, number> = {};
+    let gmailDoneMap: Record<string, boolean> = {}; // Track if Gmail sync is complete for each column
+    let gmailPageTokenMap: Record<string, string | null> = {}; // Track Gmail API pageToken for each column
+
+    columns.forEach((col) => {
+      skipMap[col.id] = 0;
+      gmailDoneMap[col.id] = false;
+      gmailPageTokenMap[col.id] = null;
+    });
+
+    if (pageToken) {
+      try {
+        const decoded = JSON.parse(
+          Buffer.from(pageToken, 'base64').toString('utf-8'),
+        );
+        skipMap = decoded.skip || decoded; // Backward compatible
+        gmailDoneMap = decoded.gmailDone || {};
+        gmailPageTokenMap = decoded.gmailPageToken || {};
+      } catch {
+        // Invalid token, start from beginning
+      }
+    }
+
+    // Get Gmail client for on-demand sync
+    let gmail: any = null;
+    try {
+      gmail = await this.getGmailClient(userId);
+    } catch (e) {
+      this.logger.warn('Could not get Gmail client for on-demand sync');
+    }
+
+    // Fetch emails from MongoDB based on status field (source of truth)
+    // If MongoDB doesn't have enough data, sync more from Gmail
+    const columnData = await Promise.all(
+      columns.map(async (col) => {
+        const now = new Date();
+        const skip = skipMap[col.id] || 0;
+
+        // Build query for this column
+        const baseQuery: any = {
+          userId: uid,
+          status: col.id,
+        };
+
+        // Count total items with this status in MongoDB
+        let total = await this.emailItemModel.countDocuments(baseQuery);
+
+        // Check if we need to sync more from Gmail
+        // Sync if: column has Gmail label AND MongoDB doesn't have enough data AND Gmail sync not done
+        const needsMore = skip + pageSize > total;
+        const hasGmailLabel = col.gmailLabel && col.gmailLabel.trim();
+        const gmailNotDone = !gmailDoneMap[col.id];
+
+        if (needsMore && hasGmailLabel && gmailNotDone && gmail) {
+          this.logger.log(
+            `[On-demand sync] Column "${col.name}": need more emails, syncing from Gmail...`,
+          );
+
+          // Sync more emails from Gmail for this column using Gmail pageToken
+          const currentGmailPageToken = gmailPageTokenMap[col.id] || undefined;
+          const syncResult = await this.syncGmailLabelToColumnOnDemand(
+            userId,
+            col.id,
+            col.gmailLabel,
+            gmail,
+            pageSize, // Sync exactly pageSize (10) emails per scroll
+            currentGmailPageToken,
+          );
+
+          // Update Gmail pageToken for next request
+          gmailPageTokenMap[col.id] = syncResult.nextGmailPageToken;
+
+          // Update gmailDone if no more emails from Gmail
+          if (!syncResult.hasMore) {
+            gmailDoneMap[col.id] = true;
+          }
+
+          // Recount after sync
+          total = await this.emailItemModel.countDocuments(baseQuery);
+        }
+
+        // Fetch paginated items from MongoDB
+        let items = await this.emailItemModel
+          .find(baseQuery)
+          .sort({ receivedAt: -1, createdAt: -1 })
+          .skip(skip)
+          .limit(pageSize)
+          .lean();
+
+        // Process items - wake up expired snoozed emails
+        items = await Promise.all(
+          items.map(async (item) => {
+            // Handle snoozed emails
+            if (item.status === EmailStatus.SNOOZED) {
+              const snoozeUntil = item.snoozeUntil
+                ? new Date(item.snoozeUntil)
+                : null;
+
+              if (snoozeUntil && Number.isFinite(snoozeUntil.getTime())) {
+                if (snoozeUntil.getTime() > now.getTime()) {
+                  // Still snoozed - hide it
+                  return null;
+                }
+
+                // Snooze expired - wake it up
+                const restoreTo = item.originalStatus ?? EmailStatus.INBOX;
+                await this.emailItemModel.updateOne(
+                  { userId: uid, messageId: item.messageId },
+                  {
+                    $set: { status: restoreTo },
+                    $unset: { snoozeUntil: 1, originalStatus: 1 },
+                  },
+                );
+                return {
+                  ...item,
+                  status: restoreTo,
+                  snoozeUntil: undefined,
+                  originalStatus: undefined,
+                  hasAttachments: item.hasAttachments ?? false,
+                };
+              } else {
+                // No valid snoozeUntil -> hide it
+                return null;
+              }
+            }
+
+            return {
+              ...item,
+              hasAttachments: item.hasAttachments ?? false,
+            };
+          }),
+        );
+
+        // Filter out nulls (hidden snoozed items)
+        const filteredItems = items.filter((i) => i !== null);
+
+        return {
+          status: col.id,
+          items: filteredItems,
+          total,
+          gmailDone: gmailDoneMap[col.id] || !hasGmailLabel, // Mark as done if no Gmail label
+        };
+      }),
+    );
+
+    const data = columnData.reduce(
+      (acc, { status, items }) => ({ ...acc, [status]: items }),
+      {} as Record<string, any[]>,
+    );
+
+    const totalMap = columnData.reduce(
+      (acc, { status, total }) => ({ ...acc, [status]: total }),
+      {} as Record<string, number>,
+    );
+
+    // Update gmailDoneMap from columnData
+    for (const col of columnData) {
+      gmailDoneMap[col.status] = col.gmailDone;
+    }
+
+    // Check if there are more items for any column
+    // hasMore = true if ANY column has more data in MongoDB OR can sync more from Gmail
+    const hasMore = columns.some((col) => {
+      const skip = skipMap[col.id] || 0;
+      const total = totalMap[col.id] || 0;
+      const hasMoreInMongo = skip + pageSize < total;
+      const canSyncMoreFromGmail = !gmailDoneMap[col.id] && col.gmailLabel;
+      return hasMoreInMongo || canSyncMoreFromGmail;
+    });
+
+    // Generate next page token
+    let nextPageToken: string | null = null;
+    if (hasMore) {
+      const nextSkipMap = columns.reduce(
+        (acc, col) => ({
+          ...acc,
+          [col.id]: (skipMap[col.id] || 0) + pageSize,
+        }),
+        {} as Record<string, number>,
+      );
+      nextPageToken = Buffer.from(
+        JSON.stringify({
+          skip: nextSkipMap,
+          gmailDone: gmailDoneMap,
+          gmailPageToken: gmailPageTokenMap,
+        }),
+      ).toString('base64');
+    }
+
+    return {
+      data,
+      meta: {
+        pageSize,
+        nextPageToken,
+        hasMore,
+        total: totalMap,
+      },
+      columns, // Include column configuration in response
+    };
+  }
+
+  /**
+   * On-demand sync: fetch emails from Gmail label and insert into MongoDB
+   * Uses Gmail pageToken for proper pagination
+   * Returns { synced: number, hasMore: boolean, nextGmailPageToken: string | null }
+   */
+  private async syncGmailLabelToColumnOnDemand(
+    userId: string,
+    columnId: string,
+    gmailLabel: string,
+    gmail: any,
+    maxResults: number,
+    gmailPageToken?: string,
+  ): Promise<{
+    synced: number;
+    hasMore: boolean;
+    nextGmailPageToken: string | null;
+  }> {
+    const uid = new Types.ObjectId(userId);
+
+    // Resolve label name -> label id
     const labelList = await gmail.users.labels.list({ userId: 'me' });
     const labels = (labelList.data.labels ?? []) as Array<{
       id?: string;
       name?: string;
-      type?: string;
     }>;
     const nameToId = new Map(
       labels
@@ -679,243 +918,100 @@ export class KanbanService {
       'UNREAD',
     ]);
 
-    // Virtual labels that use query instead of labelId
-    const virtualLabels = new Set(['SNOOZED']);
-
-    // Resolve label name -> label id (or 'SNOOZED' for virtual labels)
     const resolveLabelId = (value: string) => {
       const v = value.trim();
       if (!v) return '';
       if (systemLabelIds.has(v)) return v;
-      if (virtualLabels.has(v)) return v; // Return virtual label as-is
       if (/^Label_/.test(v)) return v;
-      const resolved = nameToId.get(v.toLowerCase());
-      if (!resolved) {
-        console.warn(
-          `[Kanban getBoard] Label "${v}" not found in Gmail. Skipping column.`,
-        );
-      }
-      return resolved ?? '';
+      return nameToId.get(v.toLowerCase()) ?? '';
     };
 
-    // Decode pageToken to get skip offset for each column
-    let skipMap: Record<string, number> = {};
-    columns.forEach((col) => {
-      skipMap[col.id] = 0;
-    });
-
-    if (pageToken) {
-      try {
-        skipMap = JSON.parse(
-          Buffer.from(pageToken, 'base64').toString('utf-8'),
-        );
-      } catch {
-        // Invalid token, start from beginning
-      }
+    const labelId = resolveLabelId(gmailLabel);
+    if (!labelId) {
+      return { synced: 0, hasMore: false, nextGmailPageToken: null };
     }
 
-    // Fetch emails from Gmail based on each column's gmailLabel
-    const columnData = await Promise.all(
-      columns.map(async (col) => {
-        const gmailLabelId = col.gmailLabel
-          ? resolveLabelId(col.gmailLabel)
-          : '';
+    try {
+      const isSnoozed = labelId === 'SNOOZED';
 
-        // For columns without Gmail labels, fetch from MongoDB by status
-        if (!gmailLabelId) {
-          this.logger.log(
-            `Column "${col.name}" has no Gmail label. Fetching from MongoDB by status.`,
-          );
+      // Use Gmail pageToken for pagination
+      const response = await gmail.users.messages.list({
+        userId: 'me',
+        ...(isSnoozed ? { q: 'is:snoozed' } : { labelIds: [labelId] }),
+        maxResults,
+        ...(gmailPageToken ? { pageToken: gmailPageToken } : {}),
+      });
 
-          // Count total items with this status
-          const total = await this.emailItemModel.countDocuments({
+      const messages = response.data.messages || [];
+      let synced = 0;
+
+      for (const msg of messages) {
+        if (!msg.id) continue;
+
+        // Check if email already exists
+        const existing = await this.emailItemModel.findOne({
+          userId: uid,
+          messageId: msg.id,
+        });
+
+        if (!existing) {
+          // New email - fetch details and insert
+          const detail = await gmail.users.messages
+            .get({ userId: 'me', id: msg.id, format: 'full' })
+            .catch(() => null);
+
+          if (!detail) continue;
+
+          const headers = detail.data.payload?.headers ?? [];
+          const fromRaw = this.getHeader(headers, 'From');
+          const subject = this.getHeader(headers, 'Subject') || '(No subject)';
+          const snippet = detail.data.snippet || subject;
+          const from = this.parseAddress(fromRaw);
+
+          // Detect attachments - exclude inline images
+          const hasAttachments = this.detectAttachments(detail.data.payload);
+
+          let receivedAt: Date | undefined;
+          if (detail.data.internalDate) {
+            receivedAt = new Date(parseInt(detail.data.internalDate, 10));
+          }
+
+          await this.emailItemModel.create({
             userId: uid,
-            status: col.id,
+            provider: 'gmail',
+            messageId: msg.id,
+            mailboxId: labelId,
+            senderName: from.name,
+            senderEmail: from.email,
+            subject,
+            snippet,
+            threadId: detail.data.threadId,
+            status: columnId,
+            hasAttachments,
+            receivedAt,
           });
 
-          // Fetch paginated items from MongoDB
-          const skip = skipMap[col.id] || 0;
-          const items = await this.emailItemModel
-            .find({ userId: uid, status: col.id })
-            .sort({ receivedAt: -1, createdAt: -1 }) // Sort by email received time, fallback to DB insert time
-            .skip(skip)
-            .limit(pageSize)
-            .lean();
+          synced++;
 
-          return {
-            status: col.id,
-            items: items.map((item) => ({
-              ...item,
-              hasAttachments: item.hasAttachments ?? false,
-            })),
-            total,
-            warning: col.gmailLabel
-              ? `Gmail label "${col.gmailLabel}" not found. Please update column settings.`
-              : undefined,
-          };
-        }
-
-        try {
-          // SNOOZED is a virtual label - use query instead of labelId
-          const isSnoozed = gmailLabelId === 'SNOOZED';
-
-          // Fetch message IDs from Gmail for this label
-          // Gmail API returns messages sorted by internalDate descending (newest first)
-          const response = await gmail.users.messages.list({
-            userId: 'me',
-            ...(isSnoozed ? { q: 'is:snoozed' } : { labelIds: [gmailLabelId] }),
-            // Limit to avoid excessive API calls and token consumption
-            maxResults: Math.min(100, (skipMap[col.id] || 0) + pageSize * 2),
-          });
-
-          const messages = response.data.messages || [];
-
-          // Apply pagination (skip already fetched items)
-          const skip = skipMap[col.id] || 0;
-          const paginatedMessages = messages.slice(skip, skip + pageSize * 2);
-
-          // Fetch email details from MongoDB (or sync if missing)
-          const items = await Promise.all(
-            paginatedMessages.map(async (msg) => {
-              let item = await this.emailItemModel
-                .findOne({ userId: uid, messageId: msg.id })
-                .lean();
-
-              // If not in MongoDB, sync it first
-              // For SNOOZED, sync to INBOX first (snoozed emails are still in INBOX)
-              if (!item) {
-                await this.syncLabelToItems(
-                  userId,
-                  isSnoozed ? 'INBOX' : gmailLabelId,
-                  1,
-                  msg.id,
-                );
-                item = await this.emailItemModel
-                  .findOne({ userId: uid, messageId: msg.id })
-                  .lean();
-              }
-
-              if (!item) return null;
-
-              // Hide active snoozed emails from the board.
-              // If a snooze has expired but cron hasn't run yet, wake it on-read.
-              if (item.status === EmailStatus.SNOOZED) {
-                const snoozeUntil = (item as any).snoozeUntil
-                  ? new Date((item as any).snoozeUntil)
-                  : null;
-
-                if (snoozeUntil && Number.isFinite(snoozeUntil.getTime())) {
-                  if (snoozeUntil.getTime() > now.getTime()) {
-                    return null;
-                  }
-
-                  const restoreTo =
-                    (item as any).originalStatus ?? EmailStatus.INBOX;
-                  await this.emailItemModel.updateOne(
-                    { userId: uid, messageId: msg.id },
-                    {
-                      $set: { status: restoreTo },
-                      $unset: { snoozeUntil: 1, originalStatus: 1 },
-                    },
-                  );
-                  item = {
-                    ...(item as any),
-                    status: restoreTo,
-                    snoozeUntil: undefined,
-                    originalStatus: undefined,
-                  };
-                } else {
-                  // No valid snoozeUntil -> keep it hidden and let cron clean it up later.
-                  return null;
-                }
-              }
-
-              // Ensure status matches column ID
-              if (item.status !== col.id) {
-                await this.emailItemModel.updateOne(
-                  { userId: uid, messageId: msg.id },
-                  { $set: { status: col.id } },
-                );
-                item.status = col.id;
-              }
-
-              return {
-                ...item,
-                hasAttachments: item.hasAttachments ?? false,
-              };
-            }),
+          // Generate embedding in background
+          this.generateAndStoreEmbedding(userId, msg.id).catch((err) =>
+            this.logger.error('Failed to generate embedding for', msg.id, err),
           );
-
-          return {
-            status: col.id,
-            items: items.filter((i) => i !== null).slice(0, pageSize),
-            total: messages.length, // Total count from Gmail
-          };
-        } catch (error) {
-          console.error(
-            `[Kanban getBoard] Failed to fetch Gmail messages for label ${gmailLabelId}:`,
-            error,
-          );
-          return {
-            status: col.id,
-            items: [],
-            total: 0,
-            error: `Failed to fetch emails for label "${col.gmailLabel}". Please check label exists in Gmail.`,
-          };
         }
-      }),
-    );
+      }
 
-    const data = columnData.reduce(
-      (acc, { status, items }) => ({ ...acc, [status]: items }),
-      {} as Record<string, any[]>,
-    );
+      // Check if Gmail has more messages
+      const hasMore = !!response.data.nextPageToken;
+      const nextGmailPageToken = response.data.nextPageToken || null;
 
-    const totalMap = columnData.reduce(
-      (acc, { status, total }) => ({ ...acc, [status]: total }),
-      {} as Record<string, number>,
-    );
-
-    // Collect warnings and errors from columns
-    const warnings = columnData
-      .filter((col) => col.warning || col.error)
-      .map((col) => ({
-        columnId: col.status,
-        message: col.warning || col.error,
-        type: col.error ? 'error' : 'warning',
-      }));
-
-    // Check if there are more items for any column
-    const hasMore = columns.some(
-      (col) => (skipMap[col.id] || 0) + pageSize < totalMap[col.id],
-    );
-
-    // Generate next page token
-    let nextPageToken: string | null = null;
-    if (hasMore) {
-      const nextSkipMap = columns.reduce(
-        (acc, col) => ({
-          ...acc,
-          [col.id]: (skipMap[col.id] || 0) + pageSize,
-        }),
-        {} as Record<string, number>,
+      this.logger.log(
+        `[On-demand sync] Synced ${synced} new emails, hasMore=${hasMore}, nextToken=${nextGmailPageToken ? 'yes' : 'no'}`,
       );
-      nextPageToken = Buffer.from(JSON.stringify(nextSkipMap)).toString(
-        'base64',
-      );
+      return { synced, hasMore, nextGmailPageToken };
+    } catch (error) {
+      this.logger.error('On-demand sync failed:', error);
+      return { synced: 0, hasMore: false, nextGmailPageToken: null };
     }
-
-    return {
-      data,
-      meta: {
-        pageSize,
-        nextPageToken,
-        hasMore,
-        total: totalMap,
-      },
-      columns, // Include column configuration in response
-      warnings: warnings.length > 0 ? warnings : undefined, // Include warnings if any
-    };
   }
 
   async updateStatus(
@@ -1135,10 +1231,168 @@ export class KanbanService {
     return this.usersService.getKanbanColumns(userId);
   }
 
+  /**
+   * Sync emails from a Gmail label into a specific column
+   * Used when creating/updating columns with Gmail label mapping
+   */
+  async syncGmailLabelToColumn(
+    userId: string,
+    columnId: string,
+    gmailLabel: string,
+    maxResults = 50,
+  ) {
+    if (!gmailLabel || !gmailLabel.trim()) {
+      return { synced: 0, message: 'No Gmail label specified' };
+    }
+
+    const gmail = await this.getGmailClient(userId);
+    const uid = new Types.ObjectId(userId);
+
+    // Resolve label name -> label id
+    const labelList = await gmail.users.labels.list({ userId: 'me' });
+    const labels = (labelList.data.labels ?? []) as Array<{
+      id?: string;
+      name?: string;
+      type?: string;
+    }>;
+    const nameToId = new Map(
+      labels
+        .filter((l) => l.name && l.id)
+        .map((l) => [String(l.name).toLowerCase(), String(l.id)]),
+    );
+
+    const systemLabelIds = new Set([
+      'INBOX',
+      'STARRED',
+      'IMPORTANT',
+      'SENT',
+      'DRAFT',
+      'TRASH',
+      'SPAM',
+      'UNREAD',
+    ]);
+
+    const virtualLabels = new Set(['SNOOZED']);
+
+    const resolveLabelId = (value: string) => {
+      const v = value.trim();
+      if (!v) return '';
+      if (systemLabelIds.has(v)) return v;
+      if (virtualLabels.has(v)) return v;
+      if (/^Label_/.test(v)) return v;
+      return nameToId.get(v.toLowerCase()) ?? '';
+    };
+
+    const labelId = resolveLabelId(gmailLabel);
+    if (!labelId) {
+      this.logger.warn(
+        `Gmail label "${gmailLabel}" not found. Skipping sync for column ${columnId}.`,
+      );
+      return { synced: 0, message: `Label "${gmailLabel}" not found in Gmail` };
+    }
+
+    try {
+      // SNOOZED uses query instead of labelId
+      const isSnoozed = labelId === 'SNOOZED';
+
+      const response = await gmail.users.messages.list({
+        userId: 'me',
+        ...(isSnoozed ? { q: 'is:snoozed' } : { labelIds: [labelId] }),
+        maxResults,
+      });
+
+      const messages = response.data.messages || [];
+      let synced = 0;
+
+      for (const msg of messages) {
+        if (!msg.id) continue;
+
+        // Check if email already exists in MongoDB
+        const existing = await this.emailItemModel.findOne({
+          userId: uid,
+          messageId: msg.id,
+        });
+
+        if (existing) {
+          // Email exists - only update status if it's still in default INBOX status
+          // Don't override if user has manually moved it to another column
+          if (existing.status === EmailStatus.INBOX && columnId !== 'INBOX') {
+            await this.emailItemModel.updateOne(
+              { userId: uid, messageId: msg.id },
+              { $set: { status: columnId } },
+            );
+            synced++;
+          }
+        } else {
+          // New email - sync from Gmail and set status to this column
+          const detail = await gmail.users.messages
+            .get({ userId: 'me', id: msg.id, format: 'full' })
+            .catch(() => null);
+
+          if (!detail) continue;
+
+          const headers = detail.data.payload?.headers ?? [];
+          const fromRaw = this.getHeader(headers, 'From');
+          const subject = this.getHeader(headers, 'Subject') || '(No subject)';
+          const snippet = detail.data.snippet || subject;
+          const from = this.parseAddress(fromRaw);
+
+          // Detect attachments - exclude inline images
+          const hasAttachments = this.detectAttachments(detail.data.payload);
+
+          // Parse receivedAt
+          let receivedAt: Date | undefined;
+          if (detail.data.internalDate) {
+            receivedAt = new Date(parseInt(detail.data.internalDate, 10));
+          }
+
+          await this.emailItemModel.create({
+            userId: uid,
+            provider: 'gmail',
+            messageId: msg.id,
+            mailboxId: labelId,
+            senderName: from.name,
+            senderEmail: from.email,
+            subject,
+            snippet,
+            threadId: detail.data.threadId,
+            status: columnId, // Set status to column ID
+            hasAttachments,
+            receivedAt,
+          });
+
+          synced++;
+
+          // Generate embedding in background
+          this.generateAndStoreEmbedding(userId, msg.id).catch((err) =>
+            this.logger.error('Failed to generate embedding for', msg.id, err),
+          );
+        }
+      }
+
+      this.logger.log(
+        `Synced ${synced} emails from Gmail label "${gmailLabel}" to column "${columnId}"`,
+      );
+      return { synced, message: `Synced ${synced} emails from ${gmailLabel}` };
+    } catch (error) {
+      this.logger.error(
+        `Failed to sync Gmail label "${gmailLabel}" to column:`,
+        error,
+      );
+      return { synced: 0, message: 'Failed to sync from Gmail' };
+    }
+  }
+
   async updateKanbanColumns(
     userId: string,
     columns: KanbanColumnConfig[],
   ): Promise<KanbanColumnConfig[]> {
+    // Get old columns to detect new Gmail label mappings
+    const oldColumns = await this.getKanbanColumns(userId);
+    const oldLabelMap = new Map(
+      oldColumns.map((c) => [c.id, c.gmailLabel || '']),
+    );
+
     const saved = await this.usersService.updateKanbanColumns(userId, columns);
 
     // If a column was deleted, emails in that status would vanish from the board.
@@ -1157,6 +1411,26 @@ export class KanbanService {
       } as any,
       { $set: { status: fallbackStatus } },
     );
+
+    // Sync emails from Gmail for columns with new/changed Gmail label mappings
+    for (const col of saved) {
+      const oldLabel = oldLabelMap.get(col.id) || '';
+      const newLabel = col.gmailLabel || '';
+
+      // Skip if label hasn't changed or is empty
+      if (oldLabel === newLabel || !newLabel) continue;
+
+      // Skip INBOX column (it's the default, no need to sync)
+      if (col.id === 'INBOX') continue;
+
+      // New or changed Gmail label - sync emails in background
+      this.logger.log(
+        `Column "${col.name}" has new Gmail label "${newLabel}". Syncing emails...`,
+      );
+      this.syncGmailLabelToColumn(userId, col.id, newLabel, 50).catch((err) =>
+        this.logger.error(`Failed to sync label ${newLabel}:`, err),
+      );
+    }
 
     return saved;
   }

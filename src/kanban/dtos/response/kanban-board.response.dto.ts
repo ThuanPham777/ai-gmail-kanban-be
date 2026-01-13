@@ -18,6 +18,8 @@ export class KanbanItemResponseDto {
   summary?: string;
   lastSummarizedAt?: string;
 
+  receivedAt?: string; // Email date from Gmail (internalDate)
+
   hasAttachments?: boolean;
 
   createdAt?: string;
@@ -49,6 +51,8 @@ export class KanbanItemResponseDto {
 
       summary: item?.summary,
       lastSummarizedAt: toIso(item?.lastSummarizedAt),
+
+      receivedAt: toIso(item?.receivedAt),
 
       hasAttachments: item?.hasAttachments,
 

@@ -193,4 +193,38 @@ export class KanbanController {
     const response = KanbanColumnsResponseDto.create(columns);
     return ApiResponseDto.success(response);
   }
+
+  @Post('columns/:columnId/sync')
+  async syncColumn(
+    @CurrentUser() user: CurrentUserData,
+    @Param('columnId') columnId: string,
+    @Query('limit') limit?: string,
+  ): Promise<ApiResponseDto<any>> {
+    if (!user?.userId) throw new BadRequestException('User not authenticated');
+
+    // Get column config to find Gmail label
+    const columns = await this.kanban.getKanbanColumns(user.userId);
+    const column = columns.find((c) => c.id === columnId);
+
+    if (!column) {
+      throw new BadRequestException(`Column "${columnId}" not found`);
+    }
+
+    if (!column.gmailLabel) {
+      return ApiResponseDto.success({
+        synced: 0,
+        message: 'Column has no Gmail label mapped',
+      });
+    }
+
+    const maxResults = limit ? parseInt(limit, 10) : 10;
+    const result = await this.kanban.syncGmailLabelToColumn(
+      user.userId,
+      columnId,
+      column.gmailLabel,
+      maxResults,
+    );
+
+    return ApiResponseDto.success(result);
+  }
 }
