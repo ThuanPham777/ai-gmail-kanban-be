@@ -35,6 +35,10 @@ export class EmailItem {
   @Prop()
   mailboxId?: string;
 
+  // Read/unread state snapshot from Gmail (labelIds includes 'UNREAD')
+  @Prop({ index: true })
+  unread?: boolean;
+
   // Snapshot metadata để render nhanh
   @Prop() senderName?: string;
   @Prop() senderEmail?: string;

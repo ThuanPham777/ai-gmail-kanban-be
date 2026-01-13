@@ -5,6 +5,8 @@ export class KanbanItemResponseDto {
   messageId: string;
   mailboxId?: string;
 
+  unread?: boolean;
+
   senderName?: string;
   senderEmail?: string;
   subject?: string;
@@ -38,6 +40,8 @@ export class KanbanItemResponseDto {
       provider: (item?.provider as 'gmail') ?? 'gmail',
       messageId: String(item?.messageId ?? item?.id ?? ''),
       mailboxId: item?.mailboxId,
+
+      unread: item?.unread,
 
       senderName: item?.senderName,
       senderEmail: item?.senderEmail,

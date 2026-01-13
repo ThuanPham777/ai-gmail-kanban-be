@@ -612,6 +612,8 @@ export class KanbanService {
 
       if (!detail) continue;
 
+      const isUnread = (detail.data.labelIds ?? []).includes('UNREAD');
+
       const headers = detail.data.payload?.headers ?? [];
       const fromRaw = this.getHeader(headers, 'From');
       const subject = this.getHeader(headers, 'Subject') || '(No subject)';
@@ -645,6 +647,7 @@ export class KanbanService {
           },
           $set: {
             mailboxId: labelId,
+            unread: isUnread,
             senderName: from.name,
             senderEmail: from.email,
             subject,
@@ -962,6 +965,8 @@ export class KanbanService {
 
           if (!detail) continue;
 
+          const isUnread = (detail.data.labelIds ?? []).includes('UNREAD');
+
           const headers = detail.data.payload?.headers ?? [];
           const fromRaw = this.getHeader(headers, 'From');
           const subject = this.getHeader(headers, 'Subject') || '(No subject)';
@@ -981,6 +986,7 @@ export class KanbanService {
             provider: 'gmail',
             messageId: msg.id,
             mailboxId: labelId,
+            unread: isUnread,
             senderName: from.name,
             senderEmail: from.email,
             subject,
@@ -1331,6 +1337,8 @@ export class KanbanService {
 
           if (!detail) continue;
 
+          const isUnread = (detail.data.labelIds ?? []).includes('UNREAD');
+
           const headers = detail.data.payload?.headers ?? [];
           const fromRaw = this.getHeader(headers, 'From');
           const subject = this.getHeader(headers, 'Subject') || '(No subject)';
@@ -1351,6 +1359,7 @@ export class KanbanService {
             provider: 'gmail',
             messageId: msg.id,
             mailboxId: labelId,
+            unread: isUnread,
             senderName: from.name,
             senderEmail: from.email,
             subject,
