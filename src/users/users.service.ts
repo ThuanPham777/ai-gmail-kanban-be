@@ -129,6 +129,57 @@ export class UsersService {
     return { refreshToken: user.gmail.refreshToken, email: user.email };
   }
 
+  /**
+   * Update Gmail Watch data (historyId, expiration)
+   */
+  async updateGmailWatch(
+    userId: string,
+    data: { historyId: string; watchExpiration: Date },
+  ) {
+    await this.userModel.updateOne(
+      { _id: userId },
+      {
+        $set: {
+          'gmail.historyId': data.historyId,
+          'gmail.watchExpiration': data.watchExpiration,
+        },
+      },
+    );
+  }
+
+  /**
+   * Update Gmail historyId after processing notifications
+   */
+  async updateGmailHistoryId(userId: string, historyId: string) {
+    await this.userModel.updateOne(
+      { _id: userId },
+      { $set: { 'gmail.historyId': historyId } },
+    );
+  }
+
+  /**
+   * Get user by email (for webhook processing)
+   */
+  async findByEmailWithGmail(email: string) {
+    return this.userModel.findOne({ email }).select('gmail email').exec();
+  }
+
+  /**
+   * Find users with expiring Gmail watch
+   */
+  async findUsersWithExpiringWatch(beforeDate: Date) {
+    return this.userModel
+      .find({
+        'gmail.refreshToken': { $exists: true, $ne: null },
+        $or: [
+          { 'gmail.watchExpiration': { $lt: beforeDate } },
+          { 'gmail.watchExpiration': { $exists: false } },
+        ],
+      })
+      .select('_id email gmail')
+      .exec();
+  }
+
   async getKanbanColumns(userId: string): Promise<KanbanColumnConfig[]> {
     let settings = await this.userSettingsModel.findOne({ userId }).exec();
     if (!settings) {

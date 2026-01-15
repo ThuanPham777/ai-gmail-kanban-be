@@ -7,6 +7,7 @@ import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { MailModule } from './mail/mail.module';
 import { KanbanModule } from './kanban/kanban.module';
+import { GmailPushModule } from './gmail-push/gmail-push.module';
 import { GlobalExceptionFilter } from './common/filters/http-exception.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { HealthModule } from './health/health.module';
@@ -25,6 +26,7 @@ import { HealthModule } from './health/health.module';
     AuthModule,
     MailModule,
     KanbanModule,
+    GmailPushModule,
     HealthModule,
   ],
   providers: [

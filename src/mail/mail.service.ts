@@ -355,25 +355,36 @@ export class MailService {
       });
     }
 
-    // Sort: system labels first, then user labels alphabetically
+    // Sort: Gmail-style order for system labels, then user labels alphabetically
+    // Gmail order: INBOX, STARRED, SNOOZED, IMPORTANT, SENT, SCHEDULED, DRAFTS, SPAM, TRASH, then categories
+    const gmailLabelOrder: Record<string, number> = {
+      INBOX: 0,
+      STARRED: 1,
+      SNOOZED: 2,
+      IMPORTANT: 3,
+      SENT: 4,
+      SCHEDULED: 5,
+      DRAFT: 6,
+      SPAM: 7,
+      TRASH: 8,
+      UNREAD: 9,
+      CATEGORY_PRIMARY: 10,
+      CATEGORY_SOCIAL: 11,
+      CATEGORY_PROMOTIONS: 12,
+      CATEGORY_UPDATES: 13,
+      CATEGORY_FORUMS: 14,
+    };
+
     items.sort((a, b) => {
-      const systemLabels = [
-        'INBOX',
-        'STARRED',
-        'IMPORTANT',
-        'SENT',
-        'TRASH',
-        'SPAM',
-        'UNREAD',
-      ];
+      const aOrder = gmailLabelOrder[a.id] ?? 100;
+      const bOrder = gmailLabelOrder[b.id] ?? 100;
 
-      const aIsSystem = systemLabels.includes(a.id);
-      const bIsSystem = systemLabels.includes(b.id);
+      // If both have defined order, sort by that
+      if (aOrder !== 100 || bOrder !== 100) {
+        return aOrder - bOrder;
+      }
 
-      if (aIsSystem && !bIsSystem) return -1;
-      if (!aIsSystem && bIsSystem) return 1;
-
-      // Both system or both user: sort alphabetically
+      // Both are user labels: sort alphabetically
       return a.name.localeCompare(b.name);
     });
 
