@@ -39,6 +39,9 @@ export class User {
       refreshToken: { type: String, required: false },
       scope: { type: String, required: false },
       connectedAt: { type: Date, required: false },
+      // Gmail Push Notifications (Watch API)
+      historyId: { type: String, required: false },
+      watchExpiration: { type: Date, required: false },
     },
     _id: false,
   })
@@ -46,6 +49,8 @@ export class User {
     refreshToken?: string;
     scope?: string;
     connectedAt?: Date;
+    historyId?: string;
+    watchExpiration?: Date;
   };
 
   @Prop({ default: Date.now })
