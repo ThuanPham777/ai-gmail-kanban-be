@@ -11,6 +11,7 @@ import { GmailPushModule } from './gmail-push/gmail-push.module';
 import { GlobalExceptionFilter } from './common/filters/http-exception.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { HealthModule } from './health/health.module';
+import { AppController } from './app.controller';
 
 @Module({
   imports: [
@@ -29,6 +30,7 @@ import { HealthModule } from './health/health.module';
     GmailPushModule,
     HealthModule,
   ],
+  controllers: [AppController],
   providers: [
     {
       provide: APP_FILTER,
