@@ -1,4 +1,4 @@
-# React Email Client & AI-Powered Kanban - Backend
+# React Email Client Integration Gmail & AI-Powered Kanban - Backend
 
 NestJS backend service powering an intelligent email management system with JWT authentication, Gmail API integration, AI-powered Kanban board, and real-time notifications.
 
@@ -67,7 +67,7 @@ NestJS backend service powering an intelligent email management system with JWT 
 ### 1. Install Dependencies
 
 ```bash
-cd react-authentication-be
+cd ai-gmail-kanban-be
 npm install
 ```
 
