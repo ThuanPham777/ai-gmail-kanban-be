@@ -1,53 +1,68 @@
-# React Email Client And AI-powered Kanban Backend
+# React Email Client & AI-Powered Kanban - Backend
 
-NestJS backend service that powers an intelligent email management system with JWT authentication, Gmail API integration, and AI-powered Kanban board for organizing emails.
+NestJS backend service powering an intelligent email management system with JWT authentication, Gmail API integration, AI-powered Kanban board, and real-time notifications.
 
-## Features
+## 🚀 Features
 
-### Authentication & Security (Google OAuth 2.0 Only)
+### Authentication & Security (Google OAuth 2.0)
 
-- **Google OAuth 2.0 code flow** - Single sign-in method for both login and registration
-- **Gmail API scopes** - Automatic permission request for email read/modify/send
-- **Offline refresh token** - Secure server-side storage for Gmail API access
-- **JWT access/refresh token rotation** - Secure session management with token rotation
-- **Hashed refresh tokens** - Server-side refresh tokens stored with bcrypt hashing
-- **Automatic token refresh** - Transparent token renewal when access token expires
-- **Concurrency handling** - Single refresh request when multiple 401s occur
-- **Cross-tab sync** - BroadcastChannel for instant auth state synchronization
-- **Secure logout** - Complete cleanup of all tokens (server + client side)
+- **Google OAuth 2.0 Authorization Code Flow** - Secure sign-in with Gmail scope access
+- **Offline Refresh Token** - Server-side encrypted storage for persistent Gmail API access
+- **JWT Token Rotation** - Access token (15m) + Refresh token (7d) with automatic rotation
+- **Hashed Refresh Tokens** - Bcrypt-hashed server-side storage
+- **Concurrency Handling** - Single refresh request queuing for multiple 401s
+- **Forced Logout** - Automatic session termination on invalid refresh token
 
-### Email Management
+### Email Management (Gmail API)
 
-- Gmail API integration for real-time email sync
-- Full email CRUD operations (read, send, reply, modify)
-- Attachment support with metadata extraction
-- Advanced email operations (mark read/unread, star, delete)
+- **Full Gmail Integration** - Read, send, reply, forward, delete emails
+- **Mailbox/Labels Support** - System labels + user-created labels with unread counts
+- **Attachment Handling** - View, download with proper filename/mimeType extraction
+- **Email Threading** - In-Reply-To and References headers for proper threading
+- **Pagination** - Token-based pagination with `nextPageToken` support
 
 ### AI-Powered Kanban Board
 
-- Dynamic, user-customizable column configuration (stored in MongoDB)
-- Drag-and-drop email organization with automatic Gmail label sync
-- AI-powered email summarization using OpenAI API
-- Smart snooze functionality with automatic wake-up
-- Real-time board updates with pagination support
-- Attachment detection and filtering
+- **Dynamic Column Configuration** - User-customizable columns stored in MongoDB
+- **Gmail Label Mapping** - Columns sync with Gmail labels on drag-drop
+- **AI Summarization** - OpenAI GPT integration for email summaries (cached 24h)
+- **Vector Embeddings** - Text-embedding-3-small for semantic search
+- **Snooze Functionality** - Hide emails until specified date/time with auto-wake cron
+- **On-Demand Sync** - Lazy loading from Gmail when scrolling
 
 ### Search & Discovery
 
-- Fuzzy search with typo tolerance (Fuse.js)
-- Semantic search using vector embeddings (Qdrant)
-- Search suggestions with contact extraction
+- **Fuzzy Search** - Typo-tolerant search using Fuse.js (threshold: 0.45)
+- **Semantic Search** - Vector similarity search with Qdrant (cosine distance)
+- **Search Suggestions** - Contact names and keyword auto-complete
 
-## Tech Stack
+### Real-Time Features
 
-- **Framework**: NestJS 11, TypeScript 5
-- **Database**: MongoDB (Mongoose 8), Qdrant Vector DB
-- **Authentication**: Passport JWT, Google Auth Library
-- **AI/ML**: OpenAI API, Vector embeddings
-- **Email**: Gmail API with OAuth 2.0
-- **Utilities**: Bcrypt, Fuse.js, Cron scheduler
+- **Gmail Push Notifications** - Google Pub/Sub webhook integration
+- **WebSocket Gateway** - Socket.IO for instant UI updates
+- **Watch Renewal** - Automatic cron job every 6 hours
 
-## Getting Started
+## 🛠 Tech Stack
+
+| Category       | Technologies                                     |
+| -------------- | ------------------------------------------------ |
+| Framework      | NestJS 11, TypeScript 5.7                        |
+| Database       | MongoDB (Mongoose 8), Qdrant Vector DB           |
+| Authentication | Passport JWT, Google Auth Library                |
+| AI/ML          | OpenAI API (GPT-4o-mini, text-embedding-3-small) |
+| Email          | Gmail API v1 with OAuth 2.0                      |
+| Real-time      | Socket.IO, Google Pub/Sub                        |
+| Scheduling     | @nestjs/schedule (Cron)                          |
+| Search         | Fuse.js, Qdrant                                  |
+
+## 📦 Getting Started
+
+### Prerequisites
+
+- Node.js 20.x or higher
+- MongoDB 7.x (local or Atlas)
+- Qdrant (local or cloud)
+- Google Cloud Project with Gmail API enabled
 
 ### 1. Install Dependencies
 
@@ -58,26 +73,37 @@ npm install
 
 ### 2. Configure Environment
 
-Create `.env` file alongside `package.json`:
+Create `.env` file:
 
 ```env
-MONGODB_URI=mongodb://localhost:27017/react-authentication
+# Server
 PORT=3000
 CORS_ORIGIN=http://localhost:5173
-JWT_ACCESS_SECRET=replace-with-strong-secret
+
+# Database
+MONGODB_URI=mongodb://localhost:27017/email-kanban
+
+# JWT Secrets
+JWT_ACCESS_SECRET=your-super-secret-access-key
 JWT_ACCESS_EXPIRES=15m
-JWT_REFRESH_SECRET=replace-with-refresh-secret # falls back to access secret if omitted
+JWT_REFRESH_SECRET=your-super-secret-refresh-key
 JWT_REFRESH_EXPIRES=7d
 
-# Google Identity Services (app login only)
-GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
-GOOGLE_CLIENT_SECRET=GOCSPX-...
+# Google OAuth 2.0
+GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-your-client-secret
 
-OPENAI_API_KEY=sk-proj-....
-OPENAI_MODEL_SUMMARY=
+# OpenAI
+OPENAI_API_KEY=sk-proj-your-openai-key
+OPENAI_MODEL_SUMMARY=gpt-4o-mini
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 
-QDRANT_URL=
-QDRANT_API_KEY=
+# Qdrant Vector Database
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=your-qdrant-api-key
+
+# Gmail Push Notifications (optional)
+GMAIL_PUBSUB_TOPIC=projects/your-project/topics/gmail-notifications
 ```
 
 ### 3. Run Development Server
@@ -86,30 +112,68 @@ QDRANT_API_KEY=
 npm run start:dev
 ```
 
-The backend will start on `http://localhost:3000`
+Server starts at `http://localhost:3000`
 
-> **Heads-up:** `GOOGLE_CLIENT_ID` must match the client ID configured in Google Identity Services (used for app login).
+### 4. Docker Compose (Optional)
 
-### Useful Commands
+```bash
+docker-compose up -d
+```
 
-| Action                      | Command                                   |
-| --------------------------- | ----------------------------------------- |
-| Start dev server with watch | `npm run start:dev`                       |
-| Lint                        | `npm run lint`                            |
-| Run tests                   | `npm run test` / `npm run test:e2e`       |
-| Production build            | `npm run build` then `npm run start:prod` |
+This starts MongoDB and Qdrant containers.
 
-## API Overview
+## 📚 API Reference
 
-### Authentication Endpoints
+### Authentication
 
-| Method | Endpoint                 | Description                                                                                                      |
-| ------ | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `POST` | `/api/auth/google/login` | Google OAuth code flow (Gmail scopes + offline refresh token). Handles both login (existing) and register (new). |
-| `POST` | `/api/auth/refresh`      | Rotate refresh token, issue new access token                                                                     |
-| `POST` | `/api/auth/logout`       | Revoke stored refresh token, clear server-side session                                                           |
+| Method | Endpoint                 | Description                                   |
+| ------ | ------------------------ | --------------------------------------------- |
+| `POST` | `/api/auth/google/login` | Google OAuth code exchange (login + register) |
+| `POST` | `/api/auth/refresh`      | Rotate tokens                                 |
+| `POST` | `/api/auth/logout`       | Revoke refresh token                          |
 
-**Note:** This app uses Google OAuth 2.0 exclusively. Email/password authentication has been removed.
+### Email
+
+| Method | Endpoint                    | Description                                 |
+| ------ | --------------------------- | ------------------------------------------- |
+| `GET`  | `/api/mailboxes`            | List Gmail labels with unread counts        |
+| `GET`  | `/api/mailboxes/:id/emails` | Paginated email list (`pageToken`, `limit`) |
+| `GET`  | `/api/emails/:id`           | Full email detail with body                 |
+| `POST` | `/api/emails/send`          | Send new email                              |
+| `POST` | `/api/emails/:id/reply`     | Reply to email (supports `replyAll`)        |
+| `POST` | `/api/emails/:id/forward`   | Forward email                               |
+| `POST` | `/api/emails/:id/modify`    | Mark read/unread, star, delete              |
+| `GET`  | `/api/attachments/:id`      | Download attachment (`emailId` query param) |
+
+### Kanban Board
+
+| Method  | Endpoint                                          | Description                     |
+| ------- | ------------------------------------------------- | ------------------------------- |
+| `GET`   | `/api/kanban/board`                               | Get board data with pagination  |
+| `GET`   | `/api/kanban/columns`                             | Get user's column configuration |
+| `POST`  | `/api/kanban/columns`                             | Update column configuration     |
+| `GET`   | `/api/kanban/gmail-labels`                        | List available Gmail labels     |
+| `POST`  | `/api/kanban/validate-label`                      | Validate Gmail label name       |
+| `PATCH` | `/api/kanban/items/:messageId/status`             | Move email to column            |
+| `POST`  | `/api/kanban/items/:messageId/snooze`             | Snooze until datetime           |
+| `POST`  | `/api/kanban/items/:messageId/summarize`          | Generate AI summary             |
+| `POST`  | `/api/kanban/items/:messageId/generate-embedding` | Generate vector embedding       |
+
+### Search
+
+| Method | Endpoint                         | Description                 |
+| ------ | -------------------------------- | --------------------------- |
+| `GET`  | `/api/kanban/search`             | Fuzzy search (`q`, `limit`) |
+| `POST` | `/api/kanban/search/semantic`    | Semantic vector search      |
+| `GET`  | `/api/kanban/search/suggestions` | Auto-suggestions            |
+
+### Gmail Push Notifications
+
+| Method | Endpoint                 | Description                        |
+| ------ | ------------------------ | ---------------------------------- |
+| `POST` | `/api/gmail/watch/start` | Start Gmail watch                  |
+| `POST` | `/api/gmail/watch/stop`  | Stop Gmail watch                   |
+| `POST` | `/api/gmail/webhook`     | Pub/Sub webhook (no auth required) |
 
 ### Health
 
@@ -117,47 +181,97 @@ The backend will start on `http://localhost:3000`
 | ------ | --------- | ------------ |
 | `GET`  | `/health` | Health check |
 
-### Mailbox & Email Endpoints
+> All endpoints except `/health` and `/api/gmail/webhook` require `Authorization: Bearer <accessToken>`
 
-| Method | Endpoint                    | Description                                                                             |
-| ------ | --------------------------- | --------------------------------------------------------------------------------------- |
-| `GET`  | `/api/mailboxes`            | List folders + unread counts (JWT)                                                      |
-| `GET`  | `/api/mailboxes/:id/emails` | Paginated list for a folder (JWT). Supports `pageToken` + `limit`, with `page` fallback |
-| `GET`  | `/api/emails/:id`           | Email detail, metadata, attachments (JWT)                                               |
-| `POST` | `/api/emails/send`          | Send email (JWT)                                                                        |
-| `POST` | `/api/emails/:id/reply`     | Reply to an email (JWT)                                                                 |
-| `POST` | `/api/emails/:id/forward`   | Forward an email (JWT)                                                                  |
-| `POST` | `/api/emails/:id/modify`    | Modify email (mark read/unread, star, etc)                                              |
-| `GET`  | `/api/attachments/:id`      | Download attachment (JWT)                                                               |
+## 🔧 Scripts
 
-### Kanban Board Endpoints
+| Command              | Description                 |
+| -------------------- | --------------------------- |
+| `npm run start:dev`  | Development with hot-reload |
+| `npm run build`      | Production build            |
+| `npm run start:prod` | Run production build        |
+| `npm run lint`       | ESLint check                |
+| `npm run test`       | Unit tests                  |
+| `npm run test:e2e`   | E2E tests                   |
 
-| Method  | Endpoint                                          | Description                        |
-| ------- | ------------------------------------------------- | ---------------------------------- |
-| `GET`   | `/api/kanban/board`                               | Get kanban board data (JWT)        |
-| `GET`   | `/api/kanban/gmail-labels`                        | List available Gmail labels (JWT)  |
-| `POST`  | `/api/kanban/validate-label`                      | Validate a Gmail label name (JWT)  |
-| `GET`   | `/api/kanban/search`                              | Fuzzy search emails (JWT)          |
-| `POST`  | `/api/kanban/search/semantic`                     | Semantic vector search (JWT)       |
-| `GET`   | `/api/kanban/search/suggestions`                  | Get search suggestions (JWT)       |
-| `POST`  | `/api/kanban/items/:messageId/generate-embedding` | Generate embedding for email (JWT) |
-| `PATCH` | `/api/kanban/items/:messageId/status`             | Update email status (JWT)          |
-| `POST`  | `/api/kanban/items/:messageId/snooze`             | Snooze email until date (JWT)      |
-| `POST`  | `/api/kanban/items/:messageId/summarize`          | Generate AI summary (JWT)          |
-| `GET`   | `/api/kanban/columns`                             | Get user's column config (JWT)     |
-| `POST`  | `/api/kanban/columns`                             | Update column configuration (JWT)  |
+## 🐳 Docker
 
-All protected routes expect `Authorization: Bearer <accessToken>`.
+### Build Image
 
-## Google Sign-In Checklist
+```bash
+docker build -t email-kanban-backend .
+```
 
-1. Create an OAuth **Web application** client in Google Cloud Console.
-2. Add your frontend origins (e.g., `http://localhost:5173`, production domain) to the client.
-3. Copy the **Client ID** into both `GOOGLE_CLIENT_ID` (backend) and `VITE_GOOGLE_CLIENT_ID` (frontend).
-4. Restart both servers so the new environment variables take effect.
+### Run with Docker Compose
 
-## Deployment Notes
+```bash
+docker-compose up -d
+```
 
-- Provide a managed MongoDB connection string through `MONGODB_URI`.
-- Ensure the deployed frontend origin is present in Google’s OAuth config and in `CORS_ORIGIN`.
-- Never commit secrets—use environment variables provided by your host (Render, Vercel, etc.).
+Services included:
+
+- **mongodb**: MongoDB 7 database
+- **qdrant**: Qdrant vector database
+
+## 🔐 Google Cloud Setup
+
+1. Create OAuth 2.0 Client ID (Web application) in Google Cloud Console
+2. Add authorized JavaScript origins:
+   - `http://localhost:5173` (development)
+   - Your production domain
+3. Enable Gmail API in the project
+4. (Optional) Set up Pub/Sub topic for push notifications
+
+## 📁 Project Structure
+
+```
+src/
+├── ai/                 # AI services (OpenAI, Qdrant)
+│   ├── ai.module.ts
+│   ├── ai.service.ts   # Email summarization, embeddings
+│   └── qdrant.service.ts # Vector database operations
+├── auth/               # Authentication
+│   ├── auth.controller.ts
+│   ├── auth.service.ts # JWT token management
+│   ├── google-auth.service.ts # OAuth code exchange
+│   ├── guards/         # JWT guard
+│   └── strategies/     # Passport JWT strategy
+├── common/             # Shared utilities
+│   ├── decorators/     # @CurrentUser decorator
+│   ├── dtos/           # API response DTOs
+│   ├── filters/        # Exception filters
+│   └── interceptors/   # Response transform
+├── gmail-push/         # Real-time notifications
+│   ├── gmail-push.controller.ts # Watch start/stop
+│   ├── gmail-push.service.ts    # Pub/Sub processing
+│   ├── gmail-push.gateway.ts    # WebSocket gateway
+│   └── gmail-push.cron.ts       # Watch renewal
+├── health/             # Health check
+├── kanban/             # Kanban board
+│   ├── kanban.controller.ts
+│   ├── kanban.service.ts # Board logic, search, AI
+│   ├── kanban.cron.ts    # Snooze wake-up
+│   └── schemas/          # EmailItem schema
+├── mail/               # Email operations
+│   ├── mail.controller.ts
+│   ├── mail.service.ts   # Gmail API integration
+│   └── dtos/             # Request/Response DTOs
+├── scripts/            # Utility scripts
+│   └── generate-embeddings.ts
+└── users/              # User management
+    ├── users.service.ts
+    └── schemas/        # User, UserSettings schemas
+```
+
+## 🔒 Security Considerations
+
+- **Access Token**: Short-lived (15m), stored in-memory on frontend
+- **Refresh Token**: Long-lived (7d), stored server-side with bcrypt hash
+- **Gmail Refresh Token**: Encrypted storage, never exposed to frontend
+- **OAuth Flow**: Authorization Code (not Implicit) for security
+- **CORS**: Strict origin validation
+- **Input Validation**: Class-validator DTOs on all endpoints
+
+## 📝 License
+
+MIT

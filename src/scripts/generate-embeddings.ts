@@ -17,7 +17,7 @@ import { Model } from 'mongoose';
 import {
   EmailItem,
   EmailItemDocument,
-} from '../kanban/schemas/email-item.chema';
+} from '../kanban/schemas/email-item.schema';
 
 async function bootstrap() {
   const logger = new Logger('EmbeddingScript');

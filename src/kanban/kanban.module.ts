@@ -3,10 +3,9 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { KanbanController } from './kanban.controller';
 import { KanbanService } from './kanban.service';
 import { UsersModule } from '../users/users.module';
-import { EmailItem, EmailItemSchema } from './schemas/email-item.chema';
+import { EmailItem, EmailItemSchema } from './schemas/email-item.schema';
 import { KanbanCron } from './kanban.cron';
 import { AiModule } from 'src/ai/ai.module';
-import { QdrantService } from 'src/ai/qdrant.service';
 
 @Module({
   imports: [
@@ -17,6 +16,6 @@ import { QdrantService } from 'src/ai/qdrant.service';
     AiModule,
   ],
   controllers: [KanbanController],
-  providers: [KanbanService, KanbanCron, QdrantService],
+  providers: [KanbanService, KanbanCron],
 })
 export class KanbanModule {}

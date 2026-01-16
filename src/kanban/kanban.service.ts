@@ -14,7 +14,7 @@ import {
   EmailItem,
   EmailItemDocument,
   EmailStatus,
-} from './schemas/email-item.chema';
+} from './schemas/email-item.schema';
 import { KanbanColumnConfig } from '../users/schemas/user-settings.schema';
 import { AiService } from 'src/ai/ai.service';
 import { QdrantService } from 'src/ai/qdrant.service';
