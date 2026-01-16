@@ -2,10 +2,11 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AiService } from './ai.service';
+import { QdrantService } from './qdrant.service';
 
 @Module({
-    imports: [ConfigModule],
-    providers: [AiService],
-    exports: [AiService],
+  imports: [ConfigModule],
+  providers: [AiService, QdrantService],
+  exports: [AiService, QdrantService],
 })
-export class AiModule { }
+export class AiModule {}

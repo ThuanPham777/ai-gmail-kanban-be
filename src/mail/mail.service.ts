@@ -925,6 +925,32 @@ export class MailService {
     const { messageId } = this.parseEmailId(emailId);
     const gmail = await this.getGmailClient(userId);
 
+    // Get message to find attachment metadata (filename, mimeType)
+    const msg = await gmail.users.messages.get({
+      userId: 'me',
+      id: messageId,
+      format: 'full',
+    });
+
+    // Find attachment metadata in message parts
+    let filename = `attachment-${attachmentId}`;
+    let mimeType = 'application/octet-stream';
+
+    const findAttachmentMeta = (payload: any): void => {
+      if (!payload) return;
+      if (payload.body?.attachmentId === attachmentId) {
+        filename = payload.filename || filename;
+        mimeType = payload.mimeType || mimeType;
+        return;
+      }
+      if (payload.parts?.length) {
+        for (const part of payload.parts) {
+          findAttachmentMeta(part);
+        }
+      }
+    };
+    findAttachmentMeta(msg.data.payload);
+
     const att = await gmail.users.messages.attachments.get({
       userId: 'me',
       messageId,
@@ -939,11 +965,10 @@ export class MailService {
       'base64',
     );
 
-    // mimeType/filename phải lấy từ EmailDetail attachments list
     return {
       data: buffer,
-      mimeType: 'application/octet-stream',
-      filename: `attachment-${attachmentId}`,
+      mimeType,
+      filename,
     };
   }
 }
