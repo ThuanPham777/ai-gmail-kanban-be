@@ -69,15 +69,20 @@ export class KanbanService {
         }));
 
       // Ensure all common system labels are included (Gmail API might not return all)
+      // Matches Gmail sidebar order
       const systemLabels = [
         'INBOX',
         'STARRED',
-        'IMPORTANT',
         'SENT',
         'DRAFT',
-        'TRASH',
+        'IMPORTANT',
         'SPAM',
+        'TRASH',
         'UNREAD',
+        // Categories
+        'CATEGORY_SOCIAL',
+        'CATEGORY_PROMOTIONS',
+        'CATEGORY_UPDATES',
       ];
 
       const existingLabelNames = new Set(
@@ -95,13 +100,20 @@ export class KanbanService {
         }
       }
 
-      // Add SNOOZED as virtual label (not a real Gmail label, uses q: 'is:snoozed')
-      // This allows users to configure a column that shows snoozed emails
-      processedLabels.push({
-        id: 'SNOOZED',
-        name: 'SNOOZED',
-        type: 'virtual', // Mark as virtual to distinguish from real labels
-      });
+      // Add virtual labels (not real Gmail labels, use query instead)
+      const virtualLabels = [
+        { id: 'SNOOZED', name: 'Snoozed' },
+        { id: 'SCHEDULED', name: 'Scheduled' },
+        { id: 'ALL_MAIL', name: 'All Mail' },
+      ];
+
+      for (const vLabel of virtualLabels) {
+        processedLabels.push({
+          id: vLabel.id,
+          name: vLabel.name,
+          type: 'virtual',
+        });
+      }
 
       return processedLabels.sort((a, b) => {
         // System labels first, then alphabetically
@@ -110,7 +122,7 @@ export class KanbanService {
         return a.name.localeCompare(b.name);
       });
     } catch (error) {
-      console.error('[Gmail Labels] Failed to fetch labels:', error);
+      this.logger.error('Failed to fetch Gmail labels', error);
       throw new InternalServerErrorException('Failed to fetch Gmail labels');
     }
   }
@@ -140,10 +152,13 @@ export class KanbanService {
         'TRASH',
         'SPAM',
         'UNREAD',
+        'CATEGORY_SOCIAL',
+        'CATEGORY_PROMOTIONS',
+        'CATEGORY_UPDATES',
       ]);
 
       // Virtual labels that use query instead of labelId
-      const virtualLabels = new Set(['SNOOZED']);
+      const virtualLabels = new Set(['SNOOZED', 'SCHEDULED', 'ALL_MAIL']);
 
       const trimmed = labelName.trim();
 
@@ -182,7 +197,7 @@ export class KanbanService {
         hint: 'The label will be used as-is. Create it in Gmail first for best results.',
       };
     } catch (error) {
-      console.error('[Gmail Label Validation] Error:', error);
+      this.logger.error('Gmail Label Validation Error', error);
       return {
         valid: false,
         message: 'Failed to validate label',
@@ -1072,9 +1087,7 @@ export class KanbanService {
           if (/^Label_/.test(v)) return v;
           const resolved = nameToId.get(v.toLowerCase());
           if (!resolved) {
-            console.warn(
-              `[Gmail Sync] Label "${v}" not found in Gmail. Using as-is.`,
-            );
+            this.logger.warn(`Label "${v}" not found in Gmail. Using as-is.`);
           }
           return resolved ?? v;
         };
@@ -1190,7 +1203,7 @@ export class KanbanService {
 
     // Generate embedding after summary (in background)
     this.generateAndStoreEmbedding(userId, messageId).catch((err) =>
-      console.error('Failed to generate embedding after summary', err),
+      this.logger.error('Failed to generate embedding after summary', err),
     );
 
     return { summary: s.summary, cached: false };
