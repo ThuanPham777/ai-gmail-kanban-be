@@ -2,6 +2,7 @@ import {
   Injectable,
   BadRequestException,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { google } from 'googleapis';
@@ -43,6 +44,8 @@ interface ModifyActions {
 
 @Injectable()
 export class MailService {
+  private readonly logger = new Logger(MailService.name);
+
   constructor(
     private readonly config: ConfigService,
     private readonly usersService: UsersService,
@@ -314,107 +317,160 @@ export class MailService {
   }
 
   // ✅ Labels = "mailboxes"
+  // Gmail-style labels matching real Gmail sidebar:
+  // Inbox (primary only), Starred, Snoozed, Sent, Drafts, Purchases, Important, Scheduled, All Mail, Spam, Trash
+  // Then Social, Promotions, Updates as separate categories
   async getMailboxes(userId: string) {
     const gmail = await this.getGmailClient(userId);
     const res = await gmail.users.labels.list({ userId: 'me' });
 
     const labels = res.data.labels ?? [];
 
-    // Gmail API already filters visible labels
-    // We just exclude some technical/internal labels that users don't need to see
-    const excludeLabels = new Set([
-      'DRAFT', // Draft folder usually not useful in email client
-    ]);
+    // Labels to show in Gmail-style sidebar (matching real Gmail)
+    // INBOX will only show Primary emails (using CATEGORY_PRIMARY filter when fetching)
+    const gmailSidebarLabels = [
+      'INBOX', // Primary emails only
+      'STARRED',
+      'SNOOZED', // Virtual - will be added separately
+      'SENT',
+      'DRAFT',
+      'CATEGORY_PURCHASES', // Purchases
+      'IMPORTANT',
+      'CATEGORY_SCHEDULED', // Scheduled
+      'ALL_MAIL', // Virtual - All Mail
+      'SPAM',
+      'TRASH',
+      // Categories as separate labels
+      'CATEGORY_SOCIAL',
+      'CATEGORY_PROMOTIONS',
+      'CATEGORY_UPDATES',
+    ];
 
-    const visibleLabels = labels.filter((lb) => {
-      if (!lb.id) return false;
-      if (excludeLabels.has(lb.id)) return false;
-      return true;
-    });
-
-    // Get unread count for each label
+    // Build items with unread counts
     const items: Array<{ id: string; name: string; unread?: number }> = [];
-    for (const lb of visibleLabels) {
-      if (!lb.id) continue;
 
-      // Some labels might fail to fetch details (e.g., hidden labels)
+    for (const labelId of gmailSidebarLabels) {
+      // Skip virtual labels - will add them separately
+      if (['SNOOZED', 'ALL_MAIL', 'CATEGORY_SCHEDULED'].includes(labelId))
+        continue;
+
+      const lb = labels.find((l) => l.id === labelId);
+      if (!lb) continue;
+
+      // Get unread count
       const detail = await gmail.users.labels
-        .get({ userId: 'me', id: lb.id })
+        .get({ userId: 'me', id: labelId })
         .catch((err) => {
-          console.warn(
-            `Failed to get label details for ${lb.id}:`,
-            err.message,
+          this.logger.warn(
+            `Failed to get label details for ${labelId}: ${err.message}`,
           );
           return null;
         });
+
+      // For INBOX, get count from primary emails only using query
+      let unread = detail?.data?.messagesUnread ?? 0;
+      if (labelId === 'INBOX') {
+        try {
+          const primaryList = await gmail.users.messages.list({
+            userId: 'me',
+            q: 'in:inbox category:primary is:unread',
+            maxResults: 100,
+          });
+          unread = primaryList.data.messages?.length ?? 0;
+        } catch {
+          // Fallback to INBOX unread count
+        }
+      }
+
+      items.push({
+        id: labelId,
+        name: lb.name ?? labelId,
+        unread,
+      });
+    }
+
+    // Add SNOOZED as virtual mailbox
+    try {
+      const snoozedList = await gmail.users.messages.list({
+        userId: 'me',
+        q: 'is:snoozed',
+        maxResults: 100,
+      });
+      const snoozedCount = snoozedList.data.messages?.length ?? 0;
+
+      // Insert after STARRED (index 1)
+      const starredIdx = items.findIndex((i) => i.id === 'STARRED');
+      items.splice(starredIdx + 1, 0, {
+        id: 'SNOOZED',
+        name: 'Snoozed',
+        unread: snoozedCount,
+      });
+    } catch (err) {
+      this.logger.warn('Failed to check snoozed emails', err);
+    }
+
+    // Add SCHEDULED as virtual mailbox (emails scheduled to send)
+    try {
+      const scheduledList = await gmail.users.messages.list({
+        userId: 'me',
+        q: 'is:scheduled',
+        maxResults: 100,
+      });
+      const scheduledCount = scheduledList.data.messages?.length ?? 0;
+
+      // Insert after Important
+      const importantIdx = items.findIndex((i) => i.id === 'IMPORTANT');
+      if (importantIdx !== -1) {
+        items.splice(importantIdx + 1, 0, {
+          id: 'SCHEDULED',
+          name: 'Scheduled',
+          unread: scheduledCount,
+        });
+      }
+    } catch (err) {
+      this.logger.warn('Failed to check scheduled emails', err);
+    }
+
+    // Add ALL_MAIL as virtual mailbox
+    try {
+      // Get total unread from All Mail
+      const allMailLabel = await gmail.users.labels
+        .get({ userId: 'me', id: 'INBOX' })
+        .catch(() => null);
+
+      // Insert before SPAM
+      const spamIdx = items.findIndex((i) => i.id === 'SPAM');
+      if (spamIdx !== -1) {
+        items.splice(spamIdx, 0, {
+          id: 'ALL_MAIL',
+          name: 'All Mail',
+          unread: 0, // All Mail typically doesn't show unread count
+        });
+      }
+    } catch (err) {
+      this.logger.warn('Failed to add All Mail', err);
+    }
+
+    // Add user-created labels at the end
+    const userLabels = labels.filter(
+      (lb) =>
+        lb.id &&
+        lb.type === 'user' &&
+        !gmailSidebarLabels.includes(lb.id) &&
+        !lb.id.startsWith('CATEGORY_'),
+    );
+
+    for (const lb of userLabels) {
+      if (!lb.id) continue;
+      const detail = await gmail.users.labels
+        .get({ userId: 'me', id: lb.id })
+        .catch(() => null);
 
       items.push({
         id: lb.id,
         name: lb.name ?? lb.id,
         unread: detail?.data?.messagesUnread ?? 0,
       });
-    }
-
-    // Sort: Gmail-style order for system labels, then user labels alphabetically
-    // Gmail order: INBOX, STARRED, SNOOZED, IMPORTANT, SENT, SCHEDULED, DRAFTS, SPAM, TRASH, then categories
-    const gmailLabelOrder: Record<string, number> = {
-      INBOX: 0,
-      STARRED: 1,
-      SNOOZED: 2,
-      IMPORTANT: 3,
-      SENT: 4,
-      SCHEDULED: 5,
-      DRAFT: 6,
-      SPAM: 7,
-      TRASH: 8,
-      UNREAD: 9,
-      CATEGORY_PRIMARY: 10,
-      CATEGORY_SOCIAL: 11,
-      CATEGORY_PROMOTIONS: 12,
-      CATEGORY_UPDATES: 13,
-      CATEGORY_FORUMS: 14,
-    };
-
-    items.sort((a, b) => {
-      const aOrder = gmailLabelOrder[a.id] ?? 100;
-      const bOrder = gmailLabelOrder[b.id] ?? 100;
-
-      // If both have defined order, sort by that
-      if (aOrder !== 100 || bOrder !== 100) {
-        return aOrder - bOrder;
-      }
-
-      // Both are user labels: sort alphabetically
-      return a.name.localeCompare(b.name);
-    });
-
-    // Add SNOOZED as virtual mailbox (Gmail doesn't have a SNOOZED label,
-    // must use q: 'is:snoozed' to fetch snoozed emails)
-    // Check if there are any snoozed emails
-    try {
-      const snoozedCheck = await gmail.users.messages.list({
-        userId: 'me',
-        q: 'is:snoozed',
-        maxResults: 1,
-      });
-
-      // Only add SNOOZED mailbox if user has snoozed emails
-      if (snoozedCheck.data.messages?.length) {
-        // Get count of snoozed emails
-        const snoozedList = await gmail.users.messages.list({
-          userId: 'me',
-          q: 'is:snoozed',
-          maxResults: 100, // Cap at 100 for performance
-        });
-
-        items.unshift({
-          id: 'SNOOZED',
-          name: 'SNOOZED',
-          unread: snoozedList.data.messages?.length ?? 0,
-        });
-      }
-    } catch (err) {
-      console.warn('Failed to check snoozed emails:', err);
     }
 
     return items;
@@ -430,12 +486,31 @@ export class MailService {
     const gmail = await this.getGmailClient(userId);
     const safeSize = Math.min(Math.max(pageSize, 1), 50);
 
-    // SNOOZED is a virtual mailbox - use query instead of labelId
+    // Virtual mailboxes and special handling
     const isSnoozed = mailboxId === 'SNOOZED';
+    const isScheduled = mailboxId === 'SCHEDULED';
+    const isAllMail = mailboxId === 'ALL_MAIL';
+    // INBOX should only show Primary emails (exclude promotions, social, updates)
+    const isInbox = mailboxId === 'INBOX';
+
+    // Build list params based on mailbox type
+    let listParams: { q?: string; labelIds?: string[] } = {};
+    if (isSnoozed) {
+      listParams = { q: 'is:snoozed' };
+    } else if (isScheduled) {
+      listParams = { q: 'is:scheduled' };
+    } else if (isAllMail) {
+      listParams = { q: 'in:all' };
+    } else if (isInbox) {
+      // INBOX: Only Primary emails using Gmail query
+      listParams = { q: 'in:inbox category:primary' };
+    } else {
+      listParams = { labelIds: [mailboxId] };
+    }
 
     const list = await gmail.users.messages.list({
       userId: 'me',
-      ...(isSnoozed ? { q: 'is:snoozed' } : { labelIds: [mailboxId] }),
+      ...listParams,
       maxResults: safeSize,
       pageToken: pageToken || undefined,
     });
@@ -514,11 +589,27 @@ export class MailService {
     const safePage = Math.min(Math.max(page, 1), 5); // cap to 5 pages to avoid deep traversal
     const safeSize = Math.min(Math.max(pageSize, 1), 50);
 
-    // SNOOZED is a virtual mailbox - use query instead of labelId
+    // Virtual mailboxes and special handling
     const isSnoozed = mailboxId === 'SNOOZED';
-    const listParams = isSnoozed
-      ? { q: 'is:snoozed' }
-      : { labelIds: [mailboxId] };
+    const isScheduled = mailboxId === 'SCHEDULED';
+    const isAllMail = mailboxId === 'ALL_MAIL';
+    // INBOX should only show Primary emails (exclude promotions, social, updates)
+    const isInbox = mailboxId === 'INBOX';
+
+    // Build list params based on mailbox type
+    let listParams: { q?: string; labelIds?: string[] } = {};
+    if (isSnoozed) {
+      listParams = { q: 'is:snoozed' };
+    } else if (isScheduled) {
+      listParams = { q: 'is:scheduled' };
+    } else if (isAllMail) {
+      listParams = { q: 'in:all' };
+    } else if (isInbox) {
+      // INBOX: Only Primary emails using Gmail query
+      listParams = { q: 'in:inbox category:primary' };
+    } else {
+      listParams = { labelIds: [mailboxId] };
+    }
 
     // traverse pageToken sequentially but cap at safePage to avoid large memory
     let pageToken: string | undefined = undefined;
