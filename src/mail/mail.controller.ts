@@ -79,6 +79,32 @@ export class MailController {
     return ApiResponseDto.success(response);
   }
 
+  /**
+   * Global email search - searches across all labels using Gmail's q parameter
+   * Does NOT filter by labelIds, enabling true global search
+   */
+  @Get('emails/search')
+  async searchEmails(
+    @CurrentUser() user: CurrentUserData,
+    @Query('q') query: string,
+    @Query('pageToken') pageToken?: string,
+    @Query('limit') limit = '20',
+  ): Promise<ApiResponseDto<EmailListResponseDto>> {
+    if (!user?.userId) throw new BadRequestException('User not authenticated');
+    if (!query?.trim())
+      throw new BadRequestException('Search query is required');
+
+    const limitNum = Number(limit) || 20;
+    const result = await this.mail.searchEmails(
+      user.userId,
+      query.trim(),
+      pageToken,
+      limitNum,
+    );
+    const response = EmailListResponseDto.create(result);
+    return ApiResponseDto.success(response);
+  }
+
   @Get('emails/:id')
   async getEmailDetail(
     @CurrentUser() user: CurrentUserData,
