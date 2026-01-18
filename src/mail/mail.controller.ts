@@ -8,9 +8,12 @@ import {
   UseGuards,
   Res,
   BadRequestException,
+  UseInterceptors,
+  UploadedFiles,
 } from '@nestjs/common';
+import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
-import { MailService } from './mail.service';
+import { MailService, UploadedFile } from './mail.service';
 import { JwtAuthGuard } from 'src/auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { CurrentUserData } from '../common/decorators/current-user.decorator';
@@ -117,12 +120,14 @@ export class MailController {
   }
 
   @Post('emails/send')
+  @UseInterceptors(FilesInterceptor('attachments', 10)) // Max 10 files
   async sendEmail(
     @CurrentUser() user: CurrentUserData,
     @Body() dto: SendEmailDto,
+    @UploadedFiles() attachments?: UploadedFile[],
   ): Promise<ApiResponseDto<SendEmailResponseDto>> {
     if (!user?.userId) throw new BadRequestException('User not authenticated');
-    const messageId = await this.mail.sendEmail(user.userId, dto);
+    const messageId = await this.mail.sendEmail(user.userId, dto, attachments);
     const response = SendEmailResponseDto.create(messageId);
     return ApiResponseDto.success(response, 'Email sent successfully');
   }
