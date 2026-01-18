@@ -8,6 +8,16 @@ import { ConfigService } from '@nestjs/config';
 import { google } from 'googleapis';
 import { UsersService } from '../users/users.service';
 
+// File upload interface (compatible with Multer)
+export interface UploadedFile {
+  fieldname: string;
+  originalname: string;
+  encoding: string;
+  mimetype: string;
+  buffer: Buffer;
+  size: number;
+}
+
 export interface EmailListItem {
   id: string; // format: labelId|messageId
   mailboxId: string; // labelId
@@ -860,13 +870,15 @@ export class MailService {
     subject: string,
     html: string,
     extraHeaders?: Record<string, string>,
+    attachments?: UploadedFile[],
   ) {
+    const boundary = `boundary_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
     const headers: string[] = [
       `From: ${from}`,
       `To: ${to.join(', ')}`,
       `Subject: ${subject}`,
       'MIME-Version: 1.0',
-      'Content-Type: text/html; charset="UTF-8"',
     ];
 
     if (extraHeaders) {
@@ -875,7 +887,49 @@ export class MailService {
       }
     }
 
-    const message = `${headers.join('\r\n')}\r\n\r\n${html}`;
+    // If no attachments, use simple text/html
+    if (!attachments || attachments.length === 0) {
+      headers.push('Content-Type: text/html; charset="UTF-8"');
+      const message = `${headers.join('\r\n')}\r\n\r\n${html}`;
+      return Buffer.from(message)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/g, '');
+    }
+
+    // With attachments, use multipart/mixed
+    headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
+
+    const parts: string[] = [];
+
+    // HTML body part
+    parts.push(
+      `--${boundary}\r\n` +
+        'Content-Type: text/html; charset="UTF-8"\r\n' +
+        'Content-Transfer-Encoding: 7bit\r\n\r\n' +
+        html,
+    );
+
+    // Attachment parts
+    for (const file of attachments) {
+      const base64Content = file.buffer.toString('base64');
+      const mimeType = file.mimetype || 'application/octet-stream';
+      const filename = file.originalname || 'attachment';
+
+      parts.push(
+        `--${boundary}\r\n` +
+          `Content-Type: ${mimeType}; name="${filename}"\r\n` +
+          'Content-Transfer-Encoding: base64\r\n' +
+          `Content-Disposition: attachment; filename="${filename}"\r\n\r\n` +
+          base64Content,
+      );
+    }
+
+    // Close boundary
+    parts.push(`--${boundary}--`);
+
+    const message = `${headers.join('\r\n')}\r\n\r\n${parts.join('\r\n')}`;
     return Buffer.from(message)
       .toString('base64')
       .replace(/\+/g, '-')
@@ -914,6 +968,7 @@ export class MailService {
       cc?: string[];
       bcc?: string[];
     },
+    attachments?: UploadedFile[],
   ) {
     if (!data.to?.length)
       throw new BadRequestException('At least one recipient is required');
@@ -931,6 +986,7 @@ export class MailService {
       data.subject,
       data.body,
       Object.keys(extraHeaders).length ? extraHeaders : undefined,
+      attachments,
     );
 
     const res = await gmail.users.messages.send({
