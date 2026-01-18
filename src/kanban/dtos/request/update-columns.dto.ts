@@ -4,10 +4,16 @@ import {
   IsString,
   IsNumber,
   IsOptional,
+  Allow,
 } from 'class-validator';
-import { Type } from 'class-transformer';
+import { Type, Exclude } from 'class-transformer';
 
 class KanbanColumnDto {
+  // Allow _id from MongoDB documents (will be ignored, not stored)
+  @Allow()
+  @Exclude()
+  _id?: any;
+
   @IsString()
   id: string;
 

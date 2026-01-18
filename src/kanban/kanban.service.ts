@@ -605,10 +605,29 @@ export class KanbanService {
       // Fetch specific message
       msgs = [{ id: specificMessageId }];
     } else {
-      // Fetch message list by label
+      // Build list params based on label type
+      // Virtual labels use query, INBOX uses category:primary
+      const isInbox = labelId === 'INBOX';
+      const isSnoozed = labelId === 'SNOOZED';
+      const isScheduled = labelId === 'SCHEDULED';
+      const isAllMail = labelId === 'ALL_MAIL';
+
+      let listParams: { q?: string; labelIds?: string[] } = {};
+      if (isInbox) {
+        listParams = { q: 'in:inbox category:primary' };
+      } else if (isSnoozed) {
+        listParams = { q: 'is:snoozed' };
+      } else if (isScheduled) {
+        listParams = { q: 'is:scheduled' };
+      } else if (isAllMail) {
+        listParams = { q: 'in:all' };
+      } else {
+        listParams = { labelIds: [labelId] };
+      }
+
       const list = await gmail.users.messages.list({
         userId: 'me',
-        labelIds: [labelId],
+        ...listParams,
         maxResults,
       });
       msgs = list.data.messages ?? [];
@@ -692,13 +711,14 @@ export class KanbanService {
     // Get user's column configuration
     const columns = await this.getKanbanColumns(userId);
 
-    // Decode pageToken to get skip offset and Gmail sync state for each column
-    let skipMap: Record<string, number> = {};
+    // Decode pageToken to get cursor (receivedAt) and Gmail sync state for each column
+    // Using cursor-based pagination instead of skip-based to handle data changes correctly
+    let cursorMap: Record<string, string | null> = {}; // receivedAt ISO string cursor per column
     let gmailDoneMap: Record<string, boolean> = {}; // Track if Gmail sync is complete for each column
     let gmailPageTokenMap: Record<string, string | null> = {}; // Track Gmail API pageToken for each column
 
     columns.forEach((col) => {
-      skipMap[col.id] = 0;
+      cursorMap[col.id] = null; // null = start from beginning (newest)
       gmailDoneMap[col.id] = false;
       gmailPageTokenMap[col.id] = null;
     });
@@ -708,7 +728,10 @@ export class KanbanService {
         const decoded = JSON.parse(
           Buffer.from(pageToken, 'base64').toString('utf-8'),
         );
-        skipMap = decoded.skip || decoded; // Backward compatible
+        // Support both old skip-based and new cursor-based tokens
+        if (decoded.cursor) {
+          cursorMap = decoded.cursor;
+        }
         gmailDoneMap = decoded.gmailDone || {};
         gmailPageTokenMap = decoded.gmailPageToken || {};
       } catch {
@@ -729,29 +752,50 @@ export class KanbanService {
     const columnData = await Promise.all(
       columns.map(async (col) => {
         const now = new Date();
-        const skip = skipMap[col.id] || 0;
+        const cursor = cursorMap[col.id]; // receivedAt ISO string or null
 
-        // Build query for this column
+        // Build query for this column using cursor-based pagination
         const baseQuery: any = {
           userId: uid,
           status: col.id,
         };
 
-        // Count total items with this status in MongoDB
-        let total = await this.emailItemModel.countDocuments(baseQuery);
+        // Add cursor condition if we have one (fetch emails OLDER than cursor)
+        if (cursor) {
+          baseQuery.receivedAt = { $lt: new Date(cursor) };
+        }
+
+        // Count total items with this status in MongoDB (for hasMore check)
+        const totalInColumn = await this.emailItemModel.countDocuments({
+          userId: uid,
+          status: col.id,
+        });
+
+        // Count items matching cursor query (items we can still fetch)
+        const itemsAfterCursor =
+          await this.emailItemModel.countDocuments(baseQuery);
 
         // Check if we need to sync more from Gmail
-        // Sync if: column has Gmail label AND MongoDB doesn't have enough data AND Gmail sync not done
-        const needsMore = skip + pageSize > total;
+        // Sync if: column has Gmail label AND not enough items after cursor AND Gmail sync not done
+        const needsMore = itemsAfterCursor < pageSize;
         const hasGmailLabel = col.gmailLabel && col.gmailLabel.trim();
         const gmailNotDone = !gmailDoneMap[col.id];
 
         if (needsMore && hasGmailLabel && gmailNotDone && gmail) {
           this.logger.log(
-            `[On-demand sync] Column "${col.name}": need more emails, syncing from Gmail...`,
+            `[On-demand sync] Column "${col.name}": need more emails (${itemsAfterCursor} available, need ${pageSize}), syncing from Gmail...`,
           );
 
-          // Sync more emails from Gmail for this column using Gmail pageToken
+          // Find the oldest email in DB for this column to use as date anchor
+          // This ensures we fetch emails OLDER than what we already have
+          const oldestEmailInDb = await this.emailItemModel
+            .findOne({ userId: uid, status: col.id })
+            .sort({ receivedAt: 1 }) // oldest first
+            .select('receivedAt')
+            .lean();
+
+          // Sync more emails from Gmail for this column
+          // Pass the oldest date to fetch emails older than our DB cache
           const currentGmailPageToken = gmailPageTokenMap[col.id] || undefined;
           const syncResult = await this.syncGmailLabelToColumnOnDemand(
             userId,
@@ -760,6 +804,7 @@ export class KanbanService {
             gmail,
             pageSize, // Sync exactly pageSize (10) emails per scroll
             currentGmailPageToken,
+            oldestEmailInDb?.receivedAt, // Pass oldest date for smarter sync
           );
 
           // Update Gmail pageToken for next request
@@ -769,16 +814,12 @@ export class KanbanService {
           if (!syncResult.hasMore) {
             gmailDoneMap[col.id] = true;
           }
-
-          // Recount after sync
-          total = await this.emailItemModel.countDocuments(baseQuery);
         }
 
-        // Fetch paginated items from MongoDB
+        // Fetch paginated items from MongoDB using cursor (no skip!)
         let items = await this.emailItemModel
           .find(baseQuery)
           .sort({ receivedAt: -1, createdAt: -1 })
-          .skip(skip)
           .limit(pageSize)
           .lean();
 
@@ -829,10 +870,17 @@ export class KanbanService {
         // Filter out nulls (hidden snoozed items)
         const filteredItems = items.filter((i) => i !== null);
 
+        // Get the oldest receivedAt from this batch for cursor
+        const oldestItem = filteredItems[filteredItems.length - 1];
+        const nextCursor = oldestItem?.receivedAt
+          ? new Date(oldestItem.receivedAt).toISOString()
+          : null;
+
         return {
           status: col.id,
           items: filteredItems,
-          total,
+          totalInColumn,
+          nextCursor,
           gmailDone: gmailDoneMap[col.id] || !hasGmailLabel, // Mark as done if no Gmail label
         };
       }),
@@ -844,38 +892,46 @@ export class KanbanService {
     );
 
     const totalMap = columnData.reduce(
-      (acc, { status, total }) => ({ ...acc, [status]: total }),
+      (acc, { status, totalInColumn }) => ({ ...acc, [status]: totalInColumn }),
       {} as Record<string, number>,
     );
 
-    // Update gmailDoneMap from columnData
+    // Build next cursor map from column results
+    const nextCursorMap: Record<string, string | null> = {};
     for (const col of columnData) {
+      // Only update cursor if we got items (otherwise keep the old cursor)
+      nextCursorMap[col.status] = col.nextCursor || cursorMap[col.status];
       gmailDoneMap[col.status] = col.gmailDone;
     }
 
-    // Check if there are more items for any column
-    // hasMore = true if ANY column has more data in MongoDB OR can sync more from Gmail
-    const hasMore = columns.some((col) => {
-      const skip = skipMap[col.id] || 0;
-      const total = totalMap[col.id] || 0;
-      const hasMoreInMongo = skip + pageSize < total;
-      const canSyncMoreFromGmail = !gmailDoneMap[col.id] && col.gmailLabel;
-      return hasMoreInMongo || canSyncMoreFromGmail;
-    });
+    // Check if this page actually returned any items
+    const thisPageHasItems = columnData.some((col) => col.items.length > 0);
 
-    // Generate next page token
+    // Check if there are more items for any column
+    // hasMore = true if:
+    // 1. ANY column returned a full page (might have more in DB)
+    // 2. OR ANY column can still sync from Gmail (even if DB is exhausted)
+    const canSyncMoreFromGmail = columns.some(
+      (col) => !gmailDoneMap[col.id] && col.gmailLabel?.trim(),
+    );
+
+    const hasMore =
+      // If we got items, check if any column has more
+      (thisPageHasItems &&
+        columns.some((col) => {
+          const colData = columnData.find((c) => c.status === col.id);
+          const returnedFullPage = (colData?.items.length || 0) >= pageSize;
+          return returnedFullPage;
+        })) ||
+      // OR if Gmail still has more to sync (even if DB is exhausted)
+      canSyncMoreFromGmail;
+
+    // Generate next page token using cursor-based pagination
     let nextPageToken: string | null = null;
     if (hasMore) {
-      const nextSkipMap = columns.reduce(
-        (acc, col) => ({
-          ...acc,
-          [col.id]: (skipMap[col.id] || 0) + pageSize,
-        }),
-        {} as Record<string, number>,
-      );
       nextPageToken = Buffer.from(
         JSON.stringify({
-          skip: nextSkipMap,
+          cursor: nextCursorMap,
           gmailDone: gmailDoneMap,
           gmailPageToken: gmailPageTokenMap,
         }),
@@ -896,7 +952,8 @@ export class KanbanService {
 
   /**
    * On-demand sync: fetch emails from Gmail label and insert into MongoDB
-   * Uses Gmail pageToken for proper pagination
+   * Uses Gmail pageToken for pagination, or falls back to date-based query
+   * @param oldestDateInDb - If provided and no pageToken, fetch emails older than this date
    * Returns { synced: number, hasMore: boolean, nextGmailPageToken: string | null }
    */
   private async syncGmailLabelToColumnOnDemand(
@@ -906,6 +963,7 @@ export class KanbanService {
     gmail: any,
     maxResults: number,
     gmailPageToken?: string,
+    oldestDateInDb?: Date,
   ): Promise<{
     synced: number;
     hasMore: boolean;
@@ -950,12 +1008,55 @@ export class KanbanService {
     }
 
     try {
+      // Build list params based on label type
+      const isInbox = labelId === 'INBOX';
       const isSnoozed = labelId === 'SNOOZED';
+      const isScheduled = labelId === 'SCHEDULED';
+      const isAllMail = labelId === 'ALL_MAIL';
+
+      let listParams: { q?: string; labelIds?: string[] } = {};
+      if (isInbox) {
+        listParams = { q: 'in:inbox category:primary' };
+      } else if (isSnoozed) {
+        listParams = { q: 'is:snoozed' };
+      } else if (isScheduled) {
+        listParams = { q: 'is:scheduled' };
+      } else if (isAllMail) {
+        listParams = { q: 'in:all' };
+      } else {
+        listParams = { labelIds: [labelId] };
+      }
+
+      // If we have emails in DB but no pageToken, add date filter to get OLDER emails
+      // This prevents re-fetching emails we already have
+      if (!gmailPageToken && oldestDateInDb) {
+        const beforeDate = new Date(oldestDateInDb);
+        // Gmail search uses YYYY/MM/DD format
+        const dateStr = `${beforeDate.getFullYear()}/${String(beforeDate.getMonth() + 1).padStart(2, '0')}/${String(beforeDate.getDate()).padStart(2, '0')}`;
+
+        // Add "before:" filter to existing query
+        if (listParams.q) {
+          listParams.q = `${listParams.q} before:${dateStr}`;
+        } else {
+          listParams = { q: `before:${dateStr}` };
+          // Also add label filter if using labelIds approach
+          if (
+            labelId &&
+            !['INBOX', 'SNOOZED', 'SCHEDULED', 'ALL_MAIL'].includes(labelId)
+          ) {
+            listParams.q = `label:${gmailLabel} before:${dateStr}`;
+          }
+        }
+
+        this.logger.log(
+          `[On-demand sync] Using date filter: before:${dateStr} (oldest in DB: ${oldestDateInDb.toISOString()})`,
+        );
+      }
 
       // Use Gmail pageToken for pagination
       const response = await gmail.users.messages.list({
         userId: 'me',
-        ...(isSnoozed ? { q: 'is:snoozed' } : { labelIds: [labelId] }),
+        ...listParams,
         maxResults,
         ...(gmailPageToken ? { pageToken: gmailPageToken } : {}),
       });
@@ -996,28 +1097,44 @@ export class KanbanService {
             receivedAt = new Date(parseInt(detail.data.internalDate, 10));
           }
 
-          await this.emailItemModel.create({
-            userId: uid,
-            provider: 'gmail',
-            messageId: msg.id,
-            mailboxId: labelId,
-            unread: isUnread,
-            senderName: from.name,
-            senderEmail: from.email,
-            subject,
-            snippet,
-            threadId: detail.data.threadId,
-            status: columnId,
-            hasAttachments,
-            receivedAt,
-          });
+          try {
+            await this.emailItemModel.create({
+              userId: uid,
+              provider: 'gmail',
+              messageId: msg.id,
+              mailboxId: labelId,
+              unread: isUnread,
+              senderName: from.name,
+              senderEmail: from.email,
+              subject,
+              snippet,
+              threadId: detail.data.threadId,
+              status: columnId,
+              hasAttachments,
+              receivedAt,
+            });
 
-          synced++;
+            synced++;
 
-          // Generate embedding in background
-          this.generateAndStoreEmbedding(userId, msg.id).catch((err) =>
-            this.logger.error('Failed to generate embedding for', msg.id, err),
-          );
+            // Generate embedding in background
+            this.generateAndStoreEmbedding(userId, msg.id).catch((err) =>
+              this.logger.error(
+                'Failed to generate embedding for',
+                msg.id,
+                err,
+              ),
+            );
+          } catch (err: any) {
+            // Ignore duplicate key error (E11000) - email was inserted by another parallel sync
+            // This happens when same email belongs to multiple labels being synced simultaneously
+            if (err?.code === 11000) {
+              this.logger.debug(
+                `Email ${msg.id} already exists (inserted by parallel sync), skipping`,
+              );
+            } else {
+              throw err; // Re-throw other errors
+            }
+          }
         }
       }
 
@@ -1291,7 +1408,7 @@ export class KanbanService {
       'UNREAD',
     ]);
 
-    const virtualLabels = new Set(['SNOOZED']);
+    const virtualLabels = new Set(['SNOOZED', 'SCHEDULED', 'ALL_MAIL']);
 
     const resolveLabelId = (value: string) => {
       const v = value.trim();
@@ -1311,12 +1428,28 @@ export class KanbanService {
     }
 
     try {
-      // SNOOZED uses query instead of labelId
+      // Build list params based on label type
+      const isInbox = labelId === 'INBOX';
       const isSnoozed = labelId === 'SNOOZED';
+      const isScheduled = labelId === 'SCHEDULED';
+      const isAllMail = labelId === 'ALL_MAIL';
+
+      let listParams: { q?: string; labelIds?: string[] } = {};
+      if (isInbox) {
+        listParams = { q: 'in:inbox category:primary' };
+      } else if (isSnoozed) {
+        listParams = { q: 'is:snoozed' };
+      } else if (isScheduled) {
+        listParams = { q: 'is:scheduled' };
+      } else if (isAllMail) {
+        listParams = { q: 'in:all' };
+      } else {
+        listParams = { labelIds: [labelId] };
+      }
 
       const response = await gmail.users.messages.list({
         userId: 'me',
-        ...(isSnoozed ? { q: 'is:snoozed' } : { labelIds: [labelId] }),
+        ...listParams,
         maxResults,
       });
 
@@ -1417,22 +1550,58 @@ export class KanbanService {
 
     const saved = await this.usersService.updateKanbanColumns(userId, columns);
 
-    // If a column was deleted, emails in that status would vanish from the board.
-    // Migrate any non-snoozed emails whose status is no longer present into the first column.
+    // Handle orphaned emails when columns are deleted
+    // Strategy: Only migrate to columns that have Gmail label mappings
+    // Columns without Gmail labels are "manual-only" - should not receive auto-migrated emails
     const allowedStatusIds = new Set(saved.map((c) => c.id));
-    const fallbackStatus = saved[0]?.id ?? EmailStatus.INBOX;
     const uid = new Types.ObjectId(userId);
 
-    await this.emailItemModel.updateMany(
-      {
-        userId: uid,
-        status: {
-          $nin: Array.from(allowedStatusIds),
-          $ne: EmailStatus.SNOOZED,
-        },
-      } as any,
-      { $set: { status: fallbackStatus } },
+    // Find columns with Gmail labels (these are "email source" columns)
+    const columnsWithLabels = saved.filter((c) => c.gmailLabel?.trim());
+
+    // Get deleted columns
+    const deletedColumns = oldColumns.filter(
+      (c) => !allowedStatusIds.has(c.id),
     );
+
+    if (deletedColumns.length > 0) {
+      for (const deletedCol of deletedColumns) {
+        const count = await this.emailItemModel.countDocuments({
+          userId: uid,
+          status: deletedCol.id,
+        });
+
+        if (count === 0) continue;
+
+        // Determine migration target:
+        // 1. Prefer INBOX column if it exists and has a Gmail label
+        // 2. Otherwise, use first column with Gmail label
+        // 3. If NO column has Gmail label, DO NOT migrate - leave emails orphaned
+        //    (they won't show up but can be recovered if user creates column with same ID or INBOX)
+        const migrationTarget =
+          columnsWithLabels.find((c) => c.id === 'INBOX') ||
+          columnsWithLabels[0];
+
+        if (migrationTarget) {
+          await this.emailItemModel.updateMany(
+            { userId: uid, status: deletedCol.id },
+            { $set: { status: migrationTarget.id } },
+          );
+
+          this.logger.log(
+            `Migrated ${count} emails from deleted column "${deletedCol.name}" to "${migrationTarget.name}"`,
+          );
+        } else {
+          // No suitable migration target - leave emails orphaned
+          // They won't appear on the board but remain in DB for potential recovery
+          this.logger.warn(
+            `No suitable column to migrate ${count} emails from deleted column "${deletedCol.name}". ` +
+              `Emails remain orphaned (status: "${deletedCol.id}"). ` +
+              `Create a column with Gmail label or recreate the deleted column to recover them.`,
+          );
+        }
+      }
+    }
 
     // Sync emails from Gmail for columns with new/changed Gmail label mappings
     for (const col of saved) {

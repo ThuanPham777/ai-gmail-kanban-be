@@ -7,15 +7,11 @@ export type EmailItemDocument = EmailItem & Document;
  * Built-in email status constants.
  * Note: The 'status' field accepts ANY string (for dynamic columns),
  * but these constants are used for:
- * - SNOOZED functionality (special status, not a column)
- * - Default values
- * - Built-in column IDs
+ * - INBOX: Default status for new emails
+ * - SNOOZED: Special temporary status for snoozed emails (not a visible column)
  */
 export enum EmailStatus {
   INBOX = 'INBOX',
-  TODO = 'TODO',
-  IN_PROGRESS = 'IN_PROGRESS',
-  DONE = 'DONE',
   SNOOZED = 'SNOOZED', // Special: temporary status for snoozed emails
 }
 
