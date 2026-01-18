@@ -577,6 +577,90 @@ export class MailService {
     };
   }
 
+  /**
+   * Search emails globally across all labels using Gmail's q parameter
+   * This method does NOT filter by labelIds, enabling true global search
+   */
+  async searchEmails(
+    userId: string,
+    query: string,
+    pageToken: string | undefined,
+    pageSize = 20,
+  ) {
+    const gmail = await this.getGmailClient(userId);
+    const safeSize = Math.min(Math.max(pageSize, 1), 50);
+
+    // Use only the q parameter for global search - no labelIds restriction
+    const list = await gmail.users.messages.list({
+      userId: 'me',
+      q: query,
+      maxResults: safeSize,
+      pageToken: pageToken || undefined,
+    });
+
+    const msgs = list.data.messages ?? [];
+    const data: EmailListItem[] = [];
+
+    // Process message details in small parallel batches to limit concurrent memory
+    const batchSize = 5;
+    for (let i = 0; i < msgs.length; i += batchSize) {
+      const batch = msgs.slice(i, i + batchSize);
+      const details = await Promise.all(
+        batch.map((m) =>
+          m.id
+            ? gmail.users.messages
+                .get({
+                  userId: 'me',
+                  id: m.id,
+                  format: 'metadata',
+                  metadataHeaders: ['From', 'Subject', 'Date'],
+                })
+                .catch(() => null)
+            : Promise.resolve(null),
+        ),
+      );
+
+      for (let j = 0; j < batch.length; j++) {
+        const m = batch[j];
+        const detail = details[j];
+        if (!m.id || !detail) continue;
+
+        const headers = detail.data.payload?.headers ?? [];
+        const fromRaw = this.getHeader(headers, 'From');
+        const subject = this.getHeader(headers, 'Subject') || '(No subject)';
+        const dateRaw = this.getHeader(headers, 'Date');
+
+        const from = this.parseAddress(fromRaw);
+        const labelIds = detail.data.labelIds ?? [];
+
+        // For search results, use SEARCH as the mailbox identifier
+        data.push({
+          id: this.composeEmailId('SEARCH', m.id),
+          mailboxId: 'SEARCH',
+          senderName: from.name,
+          senderEmail: from.email,
+          subject,
+          preview: subject,
+          timestamp: dateRaw
+            ? new Date(dateRaw).toISOString()
+            : new Date().toISOString(),
+          starred: labelIds.includes('STARRED'),
+          unread: labelIds.includes('UNREAD'),
+          important: labelIds.includes('IMPORTANT'),
+        });
+      }
+    }
+
+    return {
+      data,
+      meta: {
+        pageSize: safeSize,
+        nextPageToken: list.data.nextPageToken ?? null,
+        hasMore: !!list.data.nextPageToken,
+      },
+    };
+  }
+
   // ✅ Page number không phải native của Gmail API
   // Mình implement tối thiểu để giữ contract FE (backward compatibility):
   async getEmailsByMailbox(
