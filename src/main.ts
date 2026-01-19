@@ -2,12 +2,16 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import cookieParser from 'cookie-parser';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     logger: ['error', 'warn', 'log'],
   });
   const config = app.get(ConfigService);
+
+  // Enable cookie parsing for HttpOnly refresh token
+  app.use(cookieParser());
 
   app.useGlobalPipes(
     new ValidationPipe({

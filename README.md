@@ -9,7 +9,8 @@ NestJS backend service powering an intelligent email management system with JWT 
 - **Google OAuth 2.0 Authorization Code Flow** - Secure sign-in with Gmail scope access
 - **Offline Refresh Token** - Server-side encrypted storage for persistent Gmail API access
 - **JWT Token Rotation** - Access token (15m) + Refresh token (7d) with automatic rotation
-- **Hashed Refresh Tokens** - Bcrypt-hashed server-side storage
+- **HttpOnly Cookie Storage** - Refresh token stored in secure HttpOnly cookie (XSS-safe)
+- **Hashed Refresh Tokens** - Bcrypt-hashed server-side storage for validation
 - **Concurrency Handling** - Single refresh request queuing for multiple 401s
 - **Forced Logout** - Automatic session termination on invalid refresh token
 
@@ -126,11 +127,13 @@ This starts MongoDB and Qdrant containers.
 
 ### Authentication
 
-| Method | Endpoint                 | Description                                   |
-| ------ | ------------------------ | --------------------------------------------- |
-| `POST` | `/api/auth/google/login` | Google OAuth code exchange (login + register) |
-| `POST` | `/api/auth/refresh`      | Rotate tokens                                 |
-| `POST` | `/api/auth/logout`       | Revoke refresh token                          |
+| Method | Endpoint                 | Description                                               |
+| ------ | ------------------------ | --------------------------------------------------------- |
+| `POST` | `/api/auth/google/login` | Google OAuth code exchange → sets HttpOnly refresh cookie |
+| `POST` | `/api/auth/refresh`      | Rotate tokens (reads refresh token from cookie)           |
+| `POST` | `/api/auth/logout`       | Revoke refresh token + clear cookie                       |
+
+> **Note**: Refresh token is sent/received via HttpOnly cookie, not request/response body.
 
 ### Email
 
@@ -265,11 +268,12 @@ src/
 
 ## 🔒 Security Considerations
 
-- **Access Token**: Short-lived (15m), stored in-memory on frontend
-- **Refresh Token**: Long-lived (7d), stored server-side with bcrypt hash
-- **Gmail Refresh Token**: Encrypted storage, never exposed to frontend
+- **Access Token**: Short-lived (15m), returned in response body, stored in-memory on frontend
+- **Refresh Token**: Long-lived (7d), stored in HttpOnly cookie (Secure, SameSite=Strict) + bcrypt hash in DB
+- **Cookie Security**: HttpOnly (no JS access), Secure (HTTPS only in production), SameSite=Strict (CSRF protection)
+- **Gmail Refresh Token**: Encrypted storage in MongoDB, never exposed to frontend
 - **OAuth Flow**: Authorization Code (not Implicit) for security
-- **CORS**: Strict origin validation
+- **CORS**: Strict origin validation with credentials support
 - **Input Validation**: Class-validator DTOs on all endpoints
 
 ## 📝 License
