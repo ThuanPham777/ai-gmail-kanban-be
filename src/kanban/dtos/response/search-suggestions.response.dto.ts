@@ -1,5 +1,5 @@
 export class SearchSuggestionResponseDto {
-  type: 'contact' | 'keyword';
+  type: 'contact' | 'keyword' | 'subject';
   text: string;
   value: string;
 

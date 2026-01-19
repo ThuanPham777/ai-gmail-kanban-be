@@ -241,11 +241,13 @@ export class KanbanService {
     const results = fuse.search(q, { limit });
 
     // map to items with score and return sorted by score asc (best matches first)
+    // Fuzzy search: lower score = better match (0 = perfect match)
     return results
       .map((r) => ({
         ...(r.item as any),
         hasAttachments: (r.item as any).hasAttachments ?? false,
         _score: r.score ?? 0,
+        _searchType: 'fuzzy' as const,
       }))
       .sort((a, b) => (a._score ?? 0) - (b._score ?? 0));
   }
@@ -253,6 +255,7 @@ export class KanbanService {
   /**
    * Semantic search using vector embeddings in Qdrant
    * Finds emails by conceptual relevance, not just keyword matching
+   * Also includes fuzzy matches for keyword relevance to ensure comprehensive results
    */
   async semanticSearch(userId: string, query: string, limit = 20) {
     if (!query || !query.trim()) {
@@ -266,37 +269,54 @@ export class KanbanService {
       // Search in Qdrant with better threshold
       // Cosine similarity: 1.0 = identical, 0.0 = completely different
       // 0.5 = moderately similar, good balance for semantic search
-      const results = await this.qdrant.searchSimilar(
+      let semanticResults = await this.qdrant.searchSimilar(
         userId,
         queryEmbedding,
         limit * 2, // Get more results to filter
         0.5, // Better threshold for meaningful semantic matches
       );
 
-      if (results.length === 0) {
+      this.logger.log(
+        `Semantic search for "${query}": found ${semanticResults.length} results with threshold 0.5`,
+      );
+
+      if (semanticResults.length === 0) {
         // If no results with 0.5, try with lower threshold
         this.logger.log(
           `No results with threshold 0.5, trying 0.3 for query: ${query}`,
         );
-        const lowerResults = await this.qdrant.searchSimilar(
+        semanticResults = await this.qdrant.searchSimilar(
           userId,
           queryEmbedding,
           limit * 2,
           0.3,
         );
-        if (lowerResults.length === 0) {
-          // Fallback to fuzzy search
-          return this.searchItems(userId, query, limit);
-        }
-        results.push(...lowerResults);
       }
 
-      // Enrich with MongoDB data (batch query for better performance)
-      const messageIds = results.map((r) => r.messageId);
+      // Log top semantic results for debugging
+      semanticResults.slice(0, 3).forEach((r, i) => {
+        this.logger.log(
+          `Semantic result ${i + 1}: score=${r.score?.toFixed(4)}, subject="${r.subject?.slice(0, 50)}"`,
+        );
+      });
+
+      // Also get fuzzy search results for keyword matching
+      // This ensures we don't miss emails that have exact keyword matches but may not have embeddings
+      const fuzzyResults = await this.searchItems(userId, query, limit);
+      const fuzzyMessageIds = new Set(
+        fuzzyResults.map((r: any) => r.messageId),
+      );
+
+      this.logger.log(
+        `Fuzzy search found ${fuzzyResults.length} additional results for keyword matching`,
+      );
+
+      // Enrich semantic results with MongoDB data
+      const semanticMessageIds = semanticResults.map((r) => r.messageId);
       const items = await this.emailItemModel
         .find({
           userId: new Types.ObjectId(userId),
-          messageId: { $in: messageIds },
+          messageId: { $in: semanticMessageIds },
         })
         .select(
           '_id userId provider mailboxId messageId threadId subject senderName senderEmail snippet summary status originalStatus snoozeUntil lastSummarizedAt hasAttachments createdAt updatedAt',
@@ -307,24 +327,62 @@ export class KanbanService {
       // Create lookup map
       const itemMap = new Map(items.map((item) => [item.messageId, item]));
 
-      const enriched = [];
-      for (const result of results) {
+      const enrichedSemantic = [];
+      const semanticMessageIdSet = new Set<string>();
+
+      for (const result of semanticResults) {
         const item = itemMap.get(result.messageId);
         if (item) {
-          enriched.push({
+          // Ensure score is always a valid number between 0 and 1
+          const score =
+            typeof result.score === 'number' && !isNaN(result.score)
+              ? Math.max(0, Math.min(1, result.score))
+              : 0;
+          enrichedSemantic.push({
             ...item,
             hasAttachments: item.hasAttachments ?? false,
-            _score: result.score,
-            _searchType: 'semantic',
+            _score: score,
+            _searchType: 'semantic' as const,
           });
+          semanticMessageIdSet.add(result.messageId);
         }
       }
 
+      // Add fuzzy results that are not already in semantic results
+      // These are emails that match keywords but may not have embeddings
+      const additionalFuzzyResults = fuzzyResults.filter(
+        (r: any) => !semanticMessageIdSet.has(r.messageId),
+      );
+
+      // Combine results: semantic first (sorted by score DESC), then fuzzy (sorted by score ASC inverted)
+      const combined = [...enrichedSemantic];
+
+      // For fuzzy results not in semantic, convert score for proper ranking
+      // Fuzzy score: 0 = perfect match, 1 = worst match
+      // We convert to a comparable scale with semantic (0-1 where higher = better)
+      for (const fuzzyItem of additionalFuzzyResults) {
+        const fuzzyScore = (fuzzyItem as any)._score ?? 0;
+        // Convert fuzzy score to semantic-comparable score
+        // Perfect fuzzy match (0) becomes ~0.95, worst (1) becomes ~0.3
+        const convertedScore = Math.max(0.3, 1 - fuzzyScore * 0.7);
+        combined.push({
+          ...fuzzyItem,
+          _score: convertedScore,
+          _searchType: 'fuzzy' as const,
+        });
+      }
+
       // Sort by score descending (higher score = better match)
-      enriched.sort((a, b) => (b._score || 0) - (a._score || 0));
+      combined.sort(
+        (a, b) => ((b as any)._score || 0) - ((a as any)._score || 0),
+      );
+
+      this.logger.log(
+        `Returning ${Math.min(combined.length, limit)} combined results (${enrichedSemantic.length} semantic + ${additionalFuzzyResults.length} fuzzy) for query: ${query}`,
+      );
 
       // Return top results
-      return enriched.slice(0, limit);
+      return combined.slice(0, limit);
     } catch (error) {
       this.logger.error('Semantic search error:', error);
       // Fallback to fuzzy search if semantic search fails
@@ -333,7 +391,8 @@ export class KanbanService {
   }
 
   /**
-   * Get auto-suggestions for search based on contacts and keywords
+   * Get auto-suggestions for search based on contacts, subjects, and keywords
+   * Requires at least 2 characters to trigger suggestions
    */
   async getSearchSuggestions(userId: string, query: string, limit = 5) {
     if (!query || query.trim().length < 2) {
@@ -343,79 +402,143 @@ export class KanbanService {
     const uid = new Types.ObjectId(userId);
     const q = query.trim().toLowerCase();
 
-    // Get unique contacts from Qdrant
-    const contacts = await this.qdrant.getUniqueContacts(userId, 200);
+    // 1. Get contacts from MongoDB (more reliable than Qdrant-only)
+    const contactsFromDb = await this.emailItemModel
+      .find({ userId: uid })
+      .select('senderName senderEmail')
+      .lean()
+      .exec();
+
+    // Deduplicate contacts
+    const contactMap = new Map<string, { name: string; email: string }>();
+    contactsFromDb.forEach((email) => {
+      const emailAddr = (email as any).senderEmail?.toLowerCase();
+      if (emailAddr && !contactMap.has(emailAddr)) {
+        contactMap.set(emailAddr, {
+          name: (email as any).senderName || emailAddr,
+          email: emailAddr,
+        });
+      }
+    });
+    const contacts = Array.from(contactMap.values());
 
     // Filter contacts by query - prioritize startsWith, then includes
-    const exactMatches = contacts.filter(
+    const exactContactMatches = contacts.filter(
       (c) =>
         c.name.toLowerCase().startsWith(q) ||
         c.email.toLowerCase().startsWith(q),
     );
-    const partialMatches = contacts.filter(
+    const partialContactMatches = contacts.filter(
       (c) =>
-        !exactMatches.includes(c) &&
+        !exactContactMatches.includes(c) &&
         (c.name.toLowerCase().includes(q) || c.email.toLowerCase().includes(q)),
     );
 
-    const contactSuggestions = [...exactMatches, ...partialMatches]
-      .slice(0, 3)
+    const contactSuggestions = [
+      ...exactContactMatches,
+      ...partialContactMatches,
+    ]
+      .slice(0, 2)
       .map((c) => ({
         type: 'contact' as const,
         text: c.name,
         value: c.email,
       }));
 
-    // Get subject keywords from recent emails (increase limit)
-    const recentEmails = await this.emailItemModel
-      .find({ userId: uid })
+    // 2. Get subject suggestions (full subjects that match)
+    const matchingEmails = await this.emailItemModel
+      .find({
+        userId: uid,
+        $or: [
+          { subject: { $regex: q, $options: 'i' } },
+          { snippet: { $regex: q, $options: 'i' } },
+        ],
+      })
       .sort({ createdAt: -1 })
-      .limit(200)
+      .limit(50)
       .select('subject snippet')
       .lean()
       .exec();
 
-    // Extract keywords from subjects and snippets - better matching logic
+    // Get unique subjects that contain the query
+    const subjectSet = new Set<string>();
+    const subjectSuggestions: {
+      type: 'subject';
+      text: string;
+      value: string;
+    }[] = [];
+
+    for (const email of matchingEmails) {
+      const subject = (email as any).subject;
+      if (
+        subject &&
+        subject.toLowerCase().includes(q) &&
+        !subjectSet.has(subject.toLowerCase()) &&
+        subjectSuggestions.length < 2
+      ) {
+        subjectSet.add(subject.toLowerCase());
+        subjectSuggestions.push({
+          type: 'subject' as const,
+          text: subject.length > 50 ? subject.slice(0, 50) + '...' : subject,
+          value: subject,
+        });
+      }
+    }
+
+    // 3. Extract meaningful keywords/phrases from matching emails
     const keywordCounts = new Map<string, number>();
-    recentEmails.forEach((email) => {
-      const text = `${email.subject || ''} ${(email as any).snippet || ''}`;
-      if (text) {
-        const words = text
-          .toLowerCase()
-          .split(/[\s,\.;:!?]+/)
-          .filter(
-            (w) =>
-              w.length > 3 &&
-              (w.startsWith(q) || (q.length >= 3 && w.includes(q))),
-          );
-        words.forEach((w) => {
-          keywordCounts.set(w, (keywordCounts.get(w) || 0) + 1);
+    const phrasePattern = new RegExp(`\\b([\\w-]*${q}[\\w-]*)\\b`, 'gi');
+
+    matchingEmails.forEach((email) => {
+      const text = `${(email as any).subject || ''} ${(email as any).snippet || ''}`;
+      const matches = text.match(phrasePattern);
+      if (matches) {
+        matches.forEach((match) => {
+          const word = match.toLowerCase();
+          if (word.length >= 3 && word !== q) {
+            keywordCounts.set(word, (keywordCounts.get(word) || 0) + 1);
+          }
         });
       }
     });
 
-    // Sort keywords by frequency and relevance
+    // Sort keywords by frequency and exact match preference
     const sortedKeywords = Array.from(keywordCounts.entries())
       .sort((a, b) => {
         // Prioritize words that start with query
-        const aStarts = a[0].startsWith(q) ? 1 : 0;
-        const bStarts = b[0].startsWith(q) ? 1 : 0;
-        if (aStarts !== bStarts) return bStarts - aStarts;
+        const aStarts = a[0].startsWith(q) ? 2 : 0;
+        const bStarts = b[0].startsWith(q) ? 2 : 0;
+        // Then exact match
+        const aExact = a[0] === q ? 1 : 0;
+        const bExact = b[0] === q ? 1 : 0;
+        if (aStarts + aExact !== bStarts + bExact)
+          return bStarts + bExact - (aStarts + aExact);
         // Then by frequency
         return b[1] - a[1];
       })
+      .filter(([word]) => word !== q) // Don't suggest the exact query
       .map(([word]) => word);
 
+    const remainingSlots =
+      limit - contactSuggestions.length - subjectSuggestions.length;
     const keywordSuggestions = sortedKeywords
-      .slice(0, limit - contactSuggestions.length)
+      .slice(0, Math.max(1, remainingSlots))
       .map((k) => ({
         type: 'keyword' as const,
         text: k,
         value: k,
       }));
 
-    // Combine and ensure we have at least some suggestions
-    const combined = [...contactSuggestions, ...keywordSuggestions];
+    // 4. Combine suggestions with proper ordering:
+    // - Contacts first (people search is common)
+    // - Then subjects (specific email search)
+    // - Then keywords (topic search)
+    const combined = [
+      ...contactSuggestions,
+      ...subjectSuggestions,
+      ...keywordSuggestions,
+    ];
+
     return combined.slice(0, limit);
   }
 
