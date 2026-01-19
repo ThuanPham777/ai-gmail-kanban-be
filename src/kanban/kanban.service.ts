@@ -1625,4 +1625,403 @@ export class KanbanService {
 
     return saved;
   }
+
+  /**
+   * ============================================================
+   * GMAIL PUSH SYNC - Sync Gmail state changes to Kanban MongoDB
+   * ============================================================
+   * This method is called when Gmail Push notification is received.
+   * It syncs the email state (read/unread, labels, deleted) from Gmail
+   * to MongoDB to keep Kanban data consistent with Gmail.
+   */
+
+  /**
+   * Sync Gmail state changes to Kanban MongoDB
+   * Called by GmailPushController when receiving push notifications
+   *
+   * Handles:
+   * 1. New messages (messageAdded) - Add to Kanban if in INBOX
+   * 2. Deleted messages (messageDeleted) - Remove from Kanban
+   * 3. Label changes (labelAdded/labelRemoved) - Update status/unread in Kanban
+   *
+   * @param userId - User's MongoDB ObjectId string
+   * @param changes - Array of Gmail history changes
+   * @returns Summary of sync operations
+   */
+  async syncGmailChangesToKanban(
+    userId: string,
+    changes: Array<{
+      type: 'messageAdded' | 'messageDeleted' | 'labelAdded' | 'labelRemoved';
+      messageId: string;
+      threadId?: string;
+      labelIds?: string[];
+    }>,
+  ): Promise<{
+    added: number;
+    deleted: number;
+    updated: number;
+    errors: number;
+  }> {
+    const uid = new Types.ObjectId(userId);
+    const result = { added: 0, deleted: 0, updated: 0, errors: 0 };
+
+    if (!changes || changes.length === 0) {
+      return result;
+    }
+
+    // Get Gmail client and user's Kanban column configuration
+    let gmail: any;
+    let columns: KanbanColumnConfig[];
+
+    try {
+      gmail = await this.getGmailClient(userId);
+      columns = await this.getKanbanColumns(userId);
+    } catch (error) {
+      this.logger.error(
+        `[GmailPushSync] Failed to initialize for user ${userId}:`,
+        error,
+      );
+      return result;
+    }
+
+    // Build label -> column mapping
+    const labelToColumn = new Map<string, string>();
+    for (const col of columns) {
+      if (col.gmailLabel?.trim()) {
+        // Handle system labels directly
+        const label = col.gmailLabel.trim().toUpperCase();
+        labelToColumn.set(label, col.id);
+        // Also map the original case
+        labelToColumn.set(col.gmailLabel.trim(), col.id);
+      }
+    }
+
+    // Process each change
+    for (const change of changes) {
+      try {
+        switch (change.type) {
+          case 'messageAdded':
+            await this.handleMessageAdded(
+              uid,
+              gmail,
+              change.messageId,
+              columns,
+              labelToColumn,
+              result,
+            );
+            break;
+
+          case 'messageDeleted':
+            await this.handleMessageDeleted(uid, change.messageId, result);
+            break;
+
+          case 'labelAdded':
+          case 'labelRemoved':
+            await this.handleLabelChange(
+              uid,
+              gmail,
+              change.messageId,
+              change.labelIds || [],
+              change.type,
+              columns,
+              labelToColumn,
+              result,
+            );
+            break;
+        }
+      } catch (error) {
+        this.logger.error(
+          `[GmailPushSync] Error processing change ${change.type} for message ${change.messageId}:`,
+          error,
+        );
+        result.errors++;
+      }
+    }
+
+    this.logger.log(
+      `[GmailPushSync] Completed for user ${userId}: ` +
+        `added=${result.added}, deleted=${result.deleted}, ` +
+        `updated=${result.updated}, errors=${result.errors}`,
+    );
+
+    return result;
+  }
+
+  /**
+   * Handle new message added to Gmail
+   * Adds to Kanban if it's in INBOX or matches a column's Gmail label
+   */
+  private async handleMessageAdded(
+    uid: Types.ObjectId,
+    gmail: any,
+    messageId: string,
+    columns: KanbanColumnConfig[],
+    labelToColumn: Map<string, string>,
+    result: { added: number; deleted: number; updated: number; errors: number },
+  ): Promise<void> {
+    // Check if already exists in MongoDB
+    const existing = await this.emailItemModel.findOne({
+      userId: uid,
+      messageId,
+    });
+
+    if (existing) {
+      // Already exists, skip
+      return;
+    }
+
+    // Fetch message details from Gmail
+    const detail = await gmail.users.messages
+      .get({ userId: 'me', id: messageId, format: 'full' })
+      .catch(() => null);
+
+    if (!detail) {
+      this.logger.warn(
+        `[GmailPushSync] Could not fetch message ${messageId}, might be deleted`,
+      );
+      return;
+    }
+
+    const gmailLabels = detail.data.labelIds || [];
+
+    // Determine which column this email belongs to
+    let targetColumn = 'INBOX'; // Default
+
+    // Check if email matches any column's Gmail label
+    for (const label of gmailLabels) {
+      const columnId = labelToColumn.get(label);
+      if (columnId) {
+        targetColumn = columnId;
+        break;
+      }
+    }
+
+    // Only add if it's in INBOX or a mapped column
+    const isInInbox = gmailLabels.includes('INBOX');
+    const hasMappedColumn = targetColumn !== 'INBOX' || isInInbox;
+
+    if (!hasMappedColumn) {
+      // Not relevant to Kanban
+      return;
+    }
+
+    // Parse email metadata
+    const isUnread = gmailLabels.includes('UNREAD');
+    const headers = detail.data.payload?.headers ?? [];
+    const fromRaw = this.getHeader(headers, 'From');
+    const subject = this.getHeader(headers, 'Subject') || '(No subject)';
+    const snippet = detail.data.snippet || subject;
+    const from = this.parseAddress(fromRaw);
+    const hasAttachments = this.detectAttachments(detail.data.payload);
+
+    let receivedAt: Date | undefined;
+    if (detail.data.internalDate) {
+      receivedAt = new Date(parseInt(detail.data.internalDate, 10));
+    }
+
+    // Create new email item
+    await this.emailItemModel.create({
+      userId: uid,
+      provider: 'gmail',
+      messageId,
+      mailboxId: 'INBOX',
+      unread: isUnread,
+      senderName: from.name,
+      senderEmail: from.email,
+      subject,
+      snippet,
+      threadId: detail.data.threadId,
+      status: targetColumn,
+      hasAttachments,
+      receivedAt,
+    });
+
+    result.added++;
+
+    // Generate embedding in background
+    this.generateAndStoreEmbedding(uid.toString(), messageId).catch((err) =>
+      this.logger.error(
+        `[GmailPushSync] Failed to generate embedding for ${messageId}:`,
+        err,
+      ),
+    );
+  }
+
+  /**
+   * Handle message deleted from Gmail
+   * Removes from Kanban MongoDB
+   */
+  private async handleMessageDeleted(
+    uid: Types.ObjectId,
+    messageId: string,
+    result: { added: number; deleted: number; updated: number; errors: number },
+  ): Promise<void> {
+    const deleted = await this.emailItemModel.deleteOne({
+      userId: uid,
+      messageId,
+    });
+
+    if (deleted.deletedCount > 0) {
+      result.deleted++;
+
+      // Also remove from Qdrant vector store
+      try {
+        await this.qdrant.deleteEmbedding(messageId);
+      } catch (err) {
+        this.logger.warn(
+          `[GmailPushSync] Failed to delete embedding for ${messageId}:`,
+          err,
+        );
+      }
+    }
+  }
+
+  /**
+   * Handle label added/removed from Gmail message
+   * Updates Kanban MongoDB accordingly:
+   * - UNREAD label: Update unread status
+   * - TRASH/SPAM: Remove from Kanban (treat as deleted)
+   * - Column labels: Update status
+   * - INBOX removed: Archive (may need to remove from Kanban)
+   */
+  private async handleLabelChange(
+    uid: Types.ObjectId,
+    gmail: any,
+    messageId: string,
+    changedLabels: string[],
+    changeType: 'labelAdded' | 'labelRemoved',
+    columns: KanbanColumnConfig[],
+    labelToColumn: Map<string, string>,
+    result: { added: number; deleted: number; updated: number; errors: number },
+  ): Promise<void> {
+    // Find existing email in MongoDB
+    const existing = await this.emailItemModel.findOne({
+      userId: uid,
+      messageId,
+    });
+
+    // Handle TRASH/SPAM: Remove from Kanban
+    if (
+      changeType === 'labelAdded' &&
+      (changedLabels.includes('TRASH') || changedLabels.includes('SPAM'))
+    ) {
+      if (existing) {
+        await this.emailItemModel.deleteOne({ userId: uid, messageId });
+        result.deleted++;
+
+        // Also remove from Qdrant
+        try {
+          await this.qdrant.deleteEmbedding(messageId);
+        } catch (err) {
+          this.logger.warn(
+            `[GmailPushSync] Failed to delete embedding for ${messageId}:`,
+            err,
+          );
+        }
+      }
+      return;
+    }
+
+    // Handle UNREAD label change
+    if (changedLabels.includes('UNREAD') && existing) {
+      const newUnreadState = changeType === 'labelAdded';
+      await this.emailItemModel.updateOne(
+        { userId: uid, messageId },
+        { $set: { unread: newUnreadState } },
+      );
+      result.updated++;
+      return;
+    }
+
+    // Handle INBOX removal (archived)
+    if (changeType === 'labelRemoved' && changedLabels.includes('INBOX')) {
+      // Email was archived in Gmail
+      // Check if we have an "Archive" column (gmailLabel = "")
+      const archiveColumn = columns.find((c) => c.gmailLabel === '');
+
+      if (archiveColumn && existing) {
+        // Move to archive column
+        await this.emailItemModel.updateOne(
+          { userId: uid, messageId },
+          { $set: { status: archiveColumn.id } },
+        );
+        result.updated++;
+      } else if (existing) {
+        // No archive column - just keep in current status
+        // Or optionally remove from Kanban
+        // For now, keep it in current column
+      }
+      return;
+    }
+
+    // Handle column label changes
+    for (const label of changedLabels) {
+      const columnId = labelToColumn.get(label);
+
+      if (columnId && changeType === 'labelAdded') {
+        if (existing) {
+          // Update status to new column
+          await this.emailItemModel.updateOne(
+            { userId: uid, messageId },
+            { $set: { status: columnId } },
+          );
+          result.updated++;
+        } else {
+          // Email doesn't exist in Kanban - fetch and add it
+          await this.handleMessageAdded(
+            uid,
+            gmail,
+            messageId,
+            columns,
+            labelToColumn,
+            result,
+          );
+        }
+        return;
+      }
+    }
+
+    // If email exists but no specific handling, refetch current state from Gmail
+    if (existing) {
+      try {
+        const detail = await gmail.users.messages
+          .get({ userId: 'me', id: messageId, format: 'metadata' })
+          .catch(() => null);
+
+        if (detail) {
+          const gmailLabels = detail.data.labelIds || [];
+          const isUnread = gmailLabels.includes('UNREAD');
+
+          // Determine correct column based on current Gmail labels
+          let newStatus = existing.status;
+          for (const label of gmailLabels) {
+            const columnId = labelToColumn.get(label);
+            if (columnId) {
+              newStatus = columnId;
+              break;
+            }
+          }
+
+          // Check if in INBOX
+          if (gmailLabels.includes('INBOX') && newStatus === existing.status) {
+            newStatus = 'INBOX';
+          }
+
+          // Update if changed
+          if (isUnread !== existing.unread || newStatus !== existing.status) {
+            await this.emailItemModel.updateOne(
+              { userId: uid, messageId },
+              { $set: { unread: isUnread, status: newStatus } },
+            );
+            result.updated++;
+          }
+        }
+      } catch (err) {
+        this.logger.warn(
+          `[GmailPushSync] Failed to refetch message ${messageId}:`,
+          err,
+        );
+      }
+    }
+  }
 }
