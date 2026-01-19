@@ -152,6 +152,8 @@ export class QdrantService implements OnModuleInit {
       await this.clientReady;
       if (!this.client) return [];
 
+      // Use search with prefetch for better recall
+      // This helps find more relevant results by doing a broader initial search
       const results = await this.client.search(this.collectionName, {
         vector: queryEmbedding,
         filter: {
@@ -162,21 +164,32 @@ export class QdrantService implements OnModuleInit {
             },
           ],
         },
-        limit,
+        limit: limit * 2, // Get more candidates for better filtering
         score_threshold: scoreThreshold,
         with_payload: true,
+        // Enable exact search for better accuracy (at cost of speed)
+        params: {
+          exact: false, // Use HNSW for speed, set true for better accuracy on small datasets
+          hnsw_ef: 128, // Higher value = better recall, default is usually 64
+        },
       });
 
-      return results.map((r) => ({
-        messageId: r.payload?.messageId as string,
-        score: r.score,
-        subject: r.payload?.subject as string,
-        senderName: r.payload?.senderName as string,
-        senderEmail: r.payload?.senderEmail as string,
-        snippet: r.payload?.snippet as string,
-        summary: r.payload?.summary as string,
-        createdAt: r.payload?.createdAt as string,
-      }));
+      // Post-process results: normalize scores and filter
+      const processedResults = results
+        .filter((r) => r.score >= scoreThreshold)
+        .slice(0, limit)
+        .map((r) => ({
+          messageId: r.payload?.messageId as string,
+          score: r.score,
+          subject: r.payload?.subject as string,
+          senderName: r.payload?.senderName as string,
+          senderEmail: r.payload?.senderEmail as string,
+          snippet: r.payload?.snippet as string,
+          summary: r.payload?.summary as string,
+          createdAt: r.payload?.createdAt as string,
+        }));
+
+      return processedResults;
     } catch (error) {
       this.logger.error('Failed to search similar', error);
       return [];

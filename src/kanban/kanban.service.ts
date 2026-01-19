@@ -16,8 +16,8 @@ import {
   EmailStatus,
 } from './schemas/email-item.schema';
 import { KanbanColumnConfig } from '../users/schemas/user-settings.schema';
-import { AiService } from 'src/ai/ai.service';
-import { QdrantService } from 'src/ai/qdrant.service';
+import { AiService } from '../ai/ai.service';
+import { QdrantService } from '../ai/qdrant.service';
 import Fuse from 'fuse.js';
 
 @Injectable()
@@ -263,8 +263,8 @@ export class KanbanService {
     }
 
     try {
-      // Generate embedding for search query
-      const queryEmbedding = await this.ai.generateEmbedding(query.trim());
+      // Generate embedding for search query using query-optimized method
+      const queryEmbedding = await this.ai.generateQueryEmbedding(query.trim());
 
       // Search in Qdrant with better threshold
       // Cosine similarity: 1.0 = identical, 0.0 = completely different
@@ -544,6 +544,7 @@ export class KanbanService {
 
   /**
    * Generate and store embedding for an email item
+   * Enhanced: fetches email body from Gmail for richer embeddings
    */
   async generateAndStoreEmbedding(userId: string, messageId: string) {
     const uid = new Types.ObjectId(userId);
@@ -553,13 +554,36 @@ export class KanbanService {
       throw new NotFoundException('Email item not found');
     }
 
-    // Generate embedding
+    // Try to fetch email body from Gmail for richer embedding
+    let bodyText: string | undefined;
+    try {
+      const gmail = await this.getGmailClient(userId);
+      const msgResponse = await gmail.users.messages.get({
+        userId: 'me',
+        id: messageId,
+        format: 'full',
+      });
+
+      const { text } = this.extractText(msgResponse.data.payload);
+      if (text && text.length > 50) {
+        // Only use body if it has meaningful content
+        bodyText = text.slice(0, 3000); // Limit to avoid token issues
+      }
+    } catch (err) {
+      // Log but don't fail - we can still generate embedding from metadata
+      this.logger.warn(
+        `Could not fetch email body for ${messageId}: ${err.message}`,
+      );
+    }
+
+    // Generate embedding with enhanced content
     const embedding = await this.ai.generateEmailEmbedding({
       subject: item.subject,
       fromEmail: item.senderEmail,
       fromName: item.senderName,
       snippet: item.snippet,
       summary: item.summary,
+      bodyText, // Include body text for richer embedding
     });
 
     // Store in Qdrant
