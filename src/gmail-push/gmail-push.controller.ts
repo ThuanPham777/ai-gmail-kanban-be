@@ -14,6 +14,7 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { CurrentUserData } from '../common/decorators/current-user.decorator';
 import { ApiResponseDto } from '../common/dtos/api-response.dto';
 import { GmailPushGateway } from './gmail-push.gateway';
+import { KanbanService } from '../kanban/kanban.service';
 
 interface PubSubMessage {
   message: {
@@ -31,6 +32,7 @@ export class GmailPushController {
   constructor(
     private readonly gmailPushService: GmailPushService,
     private readonly gmailPushGateway: GmailPushGateway,
+    private readonly kanbanService: KanbanService,
   ) {}
 
   /**
@@ -76,6 +78,12 @@ export class GmailPushController {
    *
    * IMPORTANT: This endpoint should NOT require authentication
    * Google Pub/Sub will send POST requests to this endpoint
+   *
+   * Flow:
+   * 1. Receive notification from Google Pub/Sub
+   * 2. Process changes via GmailPushService (get history changes)
+   * 3. Sync changes to Kanban MongoDB via KanbanService
+   * 4. Notify frontend via WebSocket
    */
   @Post('webhook')
   @HttpCode(200) // Always return 200 to acknowledge receipt
@@ -101,13 +109,37 @@ export class GmailPushController {
         `Received Gmail notification for ${notification.emailAddress}, historyId: ${notification.historyId}`,
       );
 
-      // Process the notification
+      // Process the notification - get history changes from Gmail
       const result =
         await this.gmailPushService.processNotification(notification);
 
       if (result) {
-        // Always notify connected clients via WebSocket
-        // Even if changes.length === 0, frontend should know there's an update
+        // ============================================================
+        // CRITICAL: Sync Gmail changes to Kanban MongoDB
+        // This ensures Kanban data stays consistent with Gmail state
+        // ============================================================
+        if (result.changes.length > 0) {
+          try {
+            const syncResult =
+              await this.kanbanService.syncGmailChangesToKanban(
+                result.userId,
+                result.changes,
+              );
+            this.logger.log(
+              `[KanbanSync] Synced Gmail changes to Kanban: ` +
+                `added=${syncResult.added}, deleted=${syncResult.deleted}, ` +
+                `updated=${syncResult.updated}, errors=${syncResult.errors}`,
+            );
+          } catch (syncError: any) {
+            // Don't fail the whole webhook if Kanban sync fails
+            this.logger.error(
+              `[KanbanSync] Failed to sync to Kanban: ${syncError.message}`,
+            );
+          }
+        }
+
+        // Notify connected clients via WebSocket
+        // Frontend will invalidate React Query caches
         this.gmailPushGateway.notifyUser(result.userId, {
           type: 'gmail_update',
           changes: result.changes,

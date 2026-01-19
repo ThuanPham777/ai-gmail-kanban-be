@@ -17,5 +17,6 @@ import { AiModule } from 'src/ai/ai.module';
   ],
   controllers: [KanbanController],
   providers: [KanbanService, KanbanCron],
+  exports: [KanbanService], // Export để GmailPushModule có thể inject
 })
 export class KanbanModule {}
