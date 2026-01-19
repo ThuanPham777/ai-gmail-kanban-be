@@ -5,18 +5,25 @@ import {
   BadRequestException,
   UnauthorizedException,
   UseFilters,
+  Res,
+  Req,
 } from '@nestjs/common';
+import type { Request, Response } from 'express';
+import { ConfigService } from '@nestjs/config';
 import { AuthService } from './auth.service';
 import { UsersService } from '../users/users.service';
 import { MongoExceptionFilter } from '../common/filters/mongo-exception.filter';
 import { GoogleAuthService } from './google-auth.service';
 import { JwtPayload } from './strategies/jwt.strategy';
-import { RefreshTokenDto, LogoutDto, GoogleLoginDto } from './dtos/request';
+import { LogoutDto, GoogleLoginDto } from './dtos/request';
 import {
   RefreshTokenResponseDto,
   GoogleLoginResponseDto,
 } from './dtos/response';
 import { ApiResponseDto } from '../common/dtos/api-response.dto';
+
+const REFRESH_TOKEN_COOKIE = 'refresh_token';
+const REFRESH_TOKEN_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
 
 @Controller('api/auth')
 @UseFilters(MongoExceptionFilter)
@@ -25,28 +32,59 @@ export class AuthController {
     private readonly authService: AuthService,
     private readonly usersService: UsersService,
     private readonly googleAuthService: GoogleAuthService,
+    private readonly configService: ConfigService,
   ) {}
+
+  /**
+   * Helper to set refresh token as HttpOnly cookie
+   * Security: Cookie is HttpOnly, Secure (in production), SameSite=Strict
+   */
+  private setRefreshTokenCookie(res: Response, refreshToken: string) {
+    const isProduction = this.configService.get('NODE_ENV') === 'production';
+    res.cookie(REFRESH_TOKEN_COOKIE, refreshToken, {
+      httpOnly: true,
+      secure: isProduction, // HTTPS only in production
+      sameSite: 'strict',
+      maxAge: REFRESH_TOKEN_MAX_AGE,
+      path: '/api/auth', // Only sent to auth endpoints
+    });
+  }
+
+  /**
+   * Helper to clear refresh token cookie
+   */
+  private clearRefreshTokenCookie(res: Response) {
+    const isProduction = this.configService.get('NODE_ENV') === 'production';
+    res.clearCookie(REFRESH_TOKEN_COOKIE, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'strict',
+      path: '/api/auth',
+    });
+  }
 
   @Post('refresh')
   async refresh(
-    @Body() dto: RefreshTokenDto,
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
   ): Promise<ApiResponseDto<RefreshTokenResponseDto>> {
-    if (!dto.refreshToken) {
+    const refreshToken = req.cookies?.[REFRESH_TOKEN_COOKIE];
+    if (!refreshToken) {
       throw new UnauthorizedException('Missing refresh token');
     }
 
     let payload: JwtPayload;
     try {
-      payload = await this.authService.verifyRefreshToken<JwtPayload>(
-        dto.refreshToken,
-      );
+      payload =
+        await this.authService.verifyRefreshToken<JwtPayload>(refreshToken);
     } catch {
+      this.clearRefreshTokenCookie(res);
       throw new UnauthorizedException('Invalid refresh token');
     }
 
     const user = await this.usersService.validateRefreshToken(
       payload.sub,
-      dto.refreshToken,
+      refreshToken,
     );
 
     const { accessToken, refreshToken: newRefreshToken } =
@@ -60,20 +98,27 @@ export class AuthController {
       newRefreshToken,
     );
 
-    const response = RefreshTokenResponseDto.create(
-      accessToken,
-      newRefreshToken,
-    );
+    // Set new refresh token in HttpOnly cookie
+    this.setRefreshTokenCookie(res, newRefreshToken);
+
+    // Only return accessToken in response body (refresh token is in cookie)
+    const response = RefreshTokenResponseDto.create(accessToken);
     return ApiResponseDto.success(response, 'Token refreshed');
   }
 
   @Post('logout')
-  async logout(@Body() dto: LogoutDto): Promise<ApiResponseDto<null>> {
+  async logout(
+    @Body() dto: LogoutDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<ApiResponseDto<null>> {
     if (!dto.userId) {
       throw new BadRequestException('Missing user id');
     }
 
     await this.usersService.clearRefreshToken(dto.userId);
+
+    // Clear the refresh token cookie
+    this.clearRefreshTokenCookie(res);
 
     return ApiResponseDto.success(null, 'Logged out');
   }
@@ -87,6 +132,7 @@ export class AuthController {
   @Post('google/login')
   async googleLogin(
     @Body() dto: GoogleLoginDto,
+    @Res({ passthrough: true }) res: Response,
   ): Promise<ApiResponseDto<GoogleLoginResponseDto>> {
     const { identity, tokens } =
       await this.googleAuthService.exchangeCodeForTokens(dto.code);
@@ -123,9 +169,12 @@ export class AuthController {
       refreshToken,
     );
 
+    // Set refresh token in HttpOnly cookie (not in response body)
+    this.setRefreshTokenCookie(res, refreshToken);
+
+    // Only return accessToken in response body (refresh token is in cookie)
     const response = GoogleLoginResponseDto.create(
       accessToken,
-      refreshToken,
       user,
       isNewUser,
     );
