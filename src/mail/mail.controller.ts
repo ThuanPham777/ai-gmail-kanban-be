@@ -14,7 +14,7 @@ import {
 import { FilesInterceptor } from '@nestjs/platform-express';
 import type { Response } from 'express';
 import { MailService, UploadedFile } from './mail.service';
-import { JwtAuthGuard } from 'src/auth/guards/jwt-auth.guard';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import type { CurrentUserData } from '../common/decorators/current-user.decorator';
 import {

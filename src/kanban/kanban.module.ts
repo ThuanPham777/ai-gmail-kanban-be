@@ -5,7 +5,7 @@ import { KanbanService } from './kanban.service';
 import { UsersModule } from '../users/users.module';
 import { EmailItem, EmailItemSchema } from './schemas/email-item.schema';
 import { KanbanCron } from './kanban.cron';
-import { AiModule } from 'src/ai/ai.module';
+import { AiModule } from '../ai/ai.module';
 
 @Module({
   imports: [
