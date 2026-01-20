@@ -37,16 +37,24 @@ export class AuthController {
 
   /**
    * Helper to set refresh token as HttpOnly cookie
-   * Security: Cookie is HttpOnly, Secure (in production), SameSite=Strict
+   * Security: Cookie is HttpOnly, Secure (in production), SameSite=Lax
+   *
+   * NOTE on SameSite:
+   * - 'strict': Cookie NOT sent on cross-origin requests (breaks new tab/refresh)
+   * - 'lax': Cookie sent on top-level navigations (GET) and same-origin requests
+   * - 'none': Cookie always sent (requires Secure=true, HTTPS only)
+   *
+   * We use 'lax' for development (localhost cross-port) and 'none' for production
+   * (cross-origin between frontend domain and backend domain)
    */
   private setRefreshTokenCookie(res: Response, refreshToken: string) {
     const isProduction = this.configService.get('NODE_ENV') === 'production';
     res.cookie(REFRESH_TOKEN_COOKIE, refreshToken, {
       httpOnly: true,
       secure: isProduction, // HTTPS only in production
-      sameSite: 'strict',
+      sameSite: isProduction ? 'none' : 'lax', // 'none' for cross-origin in prod, 'lax' for dev
       maxAge: REFRESH_TOKEN_MAX_AGE,
-      path: '/api/auth', // Only sent to auth endpoints
+      path: '/', // Allow cookie to be sent to all paths (interceptor needs it)
     });
   }
 
@@ -58,8 +66,8 @@ export class AuthController {
     res.clearCookie(REFRESH_TOKEN_COOKIE, {
       httpOnly: true,
       secure: isProduction,
-      sameSite: 'strict',
-      path: '/api/auth',
+      sameSite: isProduction ? 'none' : 'lax',
+      path: '/',
     });
   }
 
